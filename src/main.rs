@@ -23,8 +23,8 @@ use serde_json::{Value, json};
 use registry::Registry;
 use store::{BlobCost, Dedup, INDEX_ENTRY_BYTES, Kind, Unpacked};
 
-/// compressed input being unpacked at once; peak memory is a few times this
-const IN_FLIGHT_BYTES: u64 = 512 << 20;
+/// compressed input being unpacked at once; peak memory is about 10x this, plus the zstd contexts
+const IN_FLIGHT_BYTES: u64 = 256 << 20;
 
 #[derive(Parser)]
 #[command(name = "rift", version, about = "Byte-exact recompression for container registries and object storage")]
