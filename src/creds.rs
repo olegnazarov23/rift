@@ -301,9 +301,10 @@ mod tests {
                 let mut buf = [0u8; 4096];
                 let _ = s.read(&mut buf);
                 let Some(&exp) = expiries.get(n) else { return };
+                // counted before answering: the client may finish reading before this thread runs on
+                count.fetch_add(1, Ordering::SeqCst);
                 let body = format!(r#"{{"AccessKeyId":"K{n}","SecretAccessKey":"S","Token":"T","Expiration":"{}"}}"#, iso(exp));
                 let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                count.fetch_add(1, Ordering::SeqCst);
             }
         });
         (url, served)
