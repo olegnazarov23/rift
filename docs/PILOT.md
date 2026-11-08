@@ -74,18 +74,24 @@ storage:
 Harbor: the same keys under `storage_service.s3` in `harbor.yml` (then `./prepare` and
 `docker compose up -d`), or under `persistence.imageChartStorage.s3` in Harbor's Helm chart.
 
-GitLab (`gitlab.rb`; check your version's registry docs for the exact option names):
+GitLab (`gitlab.rb`). Use the `s3_v2` driver, the one GitLab is moving to:
 
 ```ruby
 registry['storage'] = {
-  's3' => {
+  's3_v2' => {
     'accesskey' => '<client access key>', 'secretkey' => '<client secret key>',
     'bucket' => 'my-registry', 'region' => 'us-east-1',
-    'regionendpoint' => 'http://rift:9100', 'pathstyle' => true
+    'regionendpoint' => 'http://rift:9100', 'pathstyle' => true, 'secure' => false
   },
   'redirect' => { 'disable' => true }
 }
 ```
+
+`s3_v2` sends request checksums by default. Leave them on in front of AWS S3. If the bucket is on
+MinIO, set `'checksum_disabled' => true` as GitLab's docs say: MinIO rejects the multipart copies
+GitLab makes for blobs over 32 MB when checksums are on, with or without rift in between. Tested
+with GitLab's registry 4.41 in its classic (non-database) metadata mode; the metadata-database
+mode isn't tested yet.
 
 **Redirects (optional, later).** Registries can send clients straight to storage for blob
 downloads. To keep that, turn redirects back on and start rift with
@@ -135,5 +141,6 @@ endpoint as well as the registry.
   pushes are a small daily stream.
 - A cold pull of a big layer on few cores is slower than a plain download, about 2–3× on 6 cores.
 - gzip layers only; zstd and eStargz layers are left as they are.
-- Tested end to end with distribution 2.8.3 and Harbor 2.14.6 on MinIO; not yet on AWS S3 at scale.
+- Tested end to end with distribution 2.8.3, Harbor 2.14.6 and GitLab's registry 4.41 (classic
+  metadata) on MinIO; not yet on AWS S3 at scale.
 - No metrics endpoint yet, only logs.
