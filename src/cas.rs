@@ -565,6 +565,10 @@ pub struct Store {
     retired: Mutex<Vec<(u32, u64, u64)>>,
     /// blobs forgotten since the last GC
     forgotten: AtomicUsize,
+    /// compacted blobs whose original bytes are back in the bucket after a read, since when
+    hot: Mutex<HashMap<String, u64>>,
+    /// blobs being copied back right now
+    copying: Mutex<HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -640,6 +644,8 @@ impl Store {
             mutations: Mutex::new(()),
             retired: Mutex::new(Vec::new()),
             forgotten: AtomicUsize::new(0),
+            hot: Mutex::new(HashMap::new()),
+            copying: Mutex::new(HashSet::new()),
         })
     }
 
@@ -654,6 +660,7 @@ impl Store {
     /// The key was deleted or overwritten: its manifest goes; GC reclaims its chunks.
     pub fn forget(&self, key: &str) {
         let _m = self.mutations.lock().unwrap();
+        self.hot.lock().unwrap().remove(key);
         if self.compacted.write().unwrap().remove(key).is_some() {
             self.forgotten.fetch_add(1, Ordering::Relaxed);
             if let Err(e) = self.backend.delete(&manifest_key(key)) {
@@ -670,6 +677,51 @@ impl Store {
         }
         self.backend.put(&manifest_key(&m.key), m.encode(), &[])?;
         self.compacted.write().unwrap().insert(m.key.clone(), Arc::new(m));
+        Ok(())
+    }
+
+    /// The original bytes of this compacted blob are in the bucket; serve them as they are.
+    pub fn is_hot(&self, key: &str) -> bool {
+        self.hot.lock().unwrap().contains_key(key)
+    }
+
+    /// A listing showed the original bytes at `key`.
+    pub fn note_hot(&self, key: &str, since: u64) {
+        self.hot.lock().unwrap().entry(key.to_string()).or_insert(since);
+    }
+
+    /// Claims the copy-back of a blob that was just read cold; false if it's hot or being copied.
+    pub fn begin_hot_copy(&self, key: &str) -> bool {
+        !self.is_hot(key) && self.copying.lock().unwrap().insert(key.to_string())
+    }
+
+    /// Puts the rebuilt original, already checked against its digest, back over the stub. Only
+    /// over the stub: if the blob was deleted or replaced meanwhile, nothing is written.
+    pub fn finish_hot_copy(&self, key: &str, file: &std::path::Path, size: u64) -> Result<()> {
+        let done = (|| -> Result<()> {
+            match self.backend.head(key)? {
+                Some((0, etag)) if self.compacted(key).is_some() => {
+                    self.backend.put_file(key, std::fs::File::open(file)?, size, &[("if-match".into(), etag)])?;
+                    self.hot.lock().unwrap().insert(key.to_string(), unix_now());
+                }
+                Some((n, _)) if n == size => self.note_hot(key, unix_now()),
+                _ => {}
+            }
+            Ok(())
+        })();
+        self.copying.lock().unwrap().remove(key);
+        done
+    }
+
+    pub fn abandon_hot_copy(&self, key: &str) {
+        self.copying.lock().unwrap().remove(key);
+    }
+
+    /// Swaps the stub back in over a hot copy nobody has read lately.
+    pub fn cool(&self, key: &str, etag: &str) -> Result<()> {
+        let Some(m) = self.compacted(key) else { return Ok(()) };
+        self.backend.put(key, Vec::new(), &[("x-amz-meta-rift-size".into(), m.size.to_string()), ("if-match".into(), etag.to_string())])?;
+        self.hot.lock().unwrap().remove(key);
         Ok(())
     }
 

@@ -176,6 +176,53 @@ pub fn verify(
         && expected.bytes().zip(signature.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
+/// "20261107T120000Z" to unix seconds.
+pub fn parse_amz_date(s: &str) -> Option<u64> {
+    let n = |a: usize, b: usize| s.get(a..b)?.parse::<u32>().ok();
+    let days = days_from_civil(n(0, 4)? as i64, n(4, 6)?, n(6, 8)?);
+    Some(days as u64 * 86_400 + u64::from(n(9, 11)? * 3600 + n(11, 13)? * 60 + n(13, 15)?))
+}
+
+/// Checks a presigned URL (signature in the query string) against our credentials, and that it
+/// hasn't expired.
+pub fn verify_presigned(
+    access_key: &str,
+    secret: &str,
+    method: &str,
+    path: &str,
+    raw_query: &str,
+    header: &dyn Fn(&str) -> Option<String>,
+) -> bool {
+    let params = parse_query(raw_query);
+    let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    let (Some("AWS4-HMAC-SHA256"), Some(credential), Some(date), Some(expires), Some(signed), Some(signature)) = (
+        get("X-Amz-Algorithm"),
+        get("X-Amz-Credential"),
+        get("X-Amz-Date"),
+        get("X-Amz-Expires"),
+        get("X-Amz-SignedHeaders"),
+        get("X-Amz-Signature"),
+    ) else {
+        return false;
+    };
+    let scope: Vec<&str> = credential.split('/').collect();
+    if scope.len() != 5 || scope[0] != access_key || !date.starts_with(scope[1]) {
+        return false;
+    }
+    match (parse_amz_date(date), expires.parse::<u64>()) {
+        (Some(t), Ok(e)) if unix_now() <= t + e => {}
+        _ => return false,
+    }
+    let unsigned: Vec<(String, String)> = params.iter().filter(|(k, _)| k != "X-Amz-Signature").cloned().collect();
+    let values: Vec<(String, String)> =
+        signed.split(';').map(|h| (h.to_string(), header(h).unwrap_or_default())).collect();
+    let headers: Vec<(&str, &str)> = values.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (expected, _) =
+        sign(secret, scope[2], date, method, path, &canonical_query(&unsigned), &headers, "UNSIGNED-PAYLOAD");
+    expected.len() == signature.len()
+        && expected.bytes().zip(signature.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,8 +251,30 @@ mod tests {
     }
 
     #[test]
+    fn presigned_roundtrip() {
+        // sign a URL the way S3 clients do, then check it
+        let date = amz_date(unix_now());
+        let mut params = vec![
+            ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+            ("X-Amz-Credential".to_string(), format!("AK/{}/us-east-1/s3/aws4_request", &date[..8])),
+            ("X-Amz-Date".to_string(), date.clone()),
+            ("X-Amz-Expires".to_string(), "600".to_string()),
+            ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
+        ];
+        let q = canonical_query(&params);
+        let (sig, _) = sign("SK", "us-east-1", &date, "GET", "/b/k", &q, &[("host", "h:1")], "UNSIGNED-PAYLOAD");
+        params.push(("X-Amz-Signature".to_string(), sig));
+        let raw = canonical_query(&params);
+        let host = |h: &str| (h == "host").then(|| "h:1".to_string());
+        assert!(verify_presigned("AK", "SK", "GET", "/b/k", &raw, &host));
+        assert!(!verify_presigned("AK", "other", "GET", "/b/k", &raw, &host));
+        assert!(!verify_presigned("AK", "SK", "GET", "/b/other", &raw, &host));
+    }
+
+    #[test]
     fn dates() {
         assert_eq!(amz_date(1_369_353_600), "20130524T000000Z");
+        assert_eq!(parse_amz_date("20130524T010203Z"), Some(1_369_353_600 + 3723));
         assert_eq!(days_from_civil(2013, 5, 24), 1_369_353_600 / 86_400);
         assert_eq!(civil(days_from_civil(2024, 2, 29)), (2024, 2, 29));
     }

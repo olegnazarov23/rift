@@ -81,6 +81,12 @@ struct GatewayArgs {
     /// Rewrite packs with less than this fraction of their bytes still in use
     #[arg(long, default_value_t = 0.5)]
     gc_rewrite_below: f64,
+    /// The backend as clients reach it; presigned GETs of blobs stored as they are redirect there
+    #[arg(long)]
+    redirect_endpoint: Option<String>,
+    /// Don't put a blob's original bytes back after a cold read
+    #[arg(long)]
+    no_hot_copy: bool,
 }
 
 /// "30s", "10m", "12h", "7d" or plain seconds.
@@ -131,7 +137,16 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
         let (store, reads) = (store.clone(), reads.clone());
         thread::spawn(move || gateway::compactor(store, reads, schedule));
     }
-    Arc::new(gateway::Gateway { store, bucket: args.bucket.clone(), client_keys, reads, workers: threads }).serve(&args.listen)
+    Arc::new(gateway::Gateway {
+        store,
+        bucket: args.bucket.clone(),
+        client_keys,
+        reads,
+        workers: threads,
+        redirect: args.redirect_endpoint.clone(),
+        hot_copy: !args.no_hot_copy,
+    })
+    .serve(&args.listen)
 }
 
 #[derive(Args)]

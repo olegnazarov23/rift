@@ -4,19 +4,20 @@
 
 use std::{
     collections::HashMap,
-    io::{self, Read},
+    io::{self, Read, Write},
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, UNIX_EPOCH},
 };
 
 use anyhow::{Result, anyhow};
+use sha2::{Digest, Sha256};
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 
 use crate::{
     cas::{Manifest, Store, blob_digest},
     s3::{self, Backend, decode_aws_chunked, xml_all, xml_escape, xml_unescape},
-    sigv4::{self, parse_query, unix_now, uri_decode},
+    sigv4::{self, hex, parse_query, unix_now, uri_decode},
 };
 
 pub struct Gateway {
@@ -27,7 +28,19 @@ pub struct Gateway {
     /// last time each blob was read, unix seconds; the compactor leaves recently read blobs alone
     pub reads: Arc<Mutex<HashMap<String, u64>>>,
     pub workers: usize,
+    /// the backend as clients reach it: presigned GETs of blobs stored as they are redirect there
+    pub redirect: Option<String>,
+    /// put a blob's original bytes back after a cold read, until it goes cold again
+    pub hot_copy: bool,
 }
+
+/// Query parameters that only carry a presigned URL's signature.
+const PRESIGN_PARAMS: &[&str] = &[
+    "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires", "X-Amz-SignedHeaders",
+    "X-Amz-Signature", "X-Amz-Security-Token", "x-id",
+];
+
+static COPY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Bucket-level GETs that aren't object listings.
 const BUCKET_SUBRESOURCES: &[&str] = &[
@@ -196,13 +209,19 @@ impl Gateway {
             .map(|x| (x.field.as_str().as_str().to_ascii_lowercase(), x.value.as_str().to_string()))
             .collect();
         let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+        let mut query = parse_query(raw_query);
+        let presigned = query.iter().any(|(k, _)| k == "X-Amz-Signature");
         if let Some((access, secret)) = &self.client_keys {
-            let signed = header("authorization")
-                .is_some_and(|a| sigv4::verify(access, secret, method, raw_path, raw_query, &a, &header));
+            let signed = if presigned {
+                matches!(method, "GET" | "HEAD") && sigv4::verify_presigned(access, secret, method, raw_path, raw_query, &header)
+            } else {
+                header("authorization").is_some_and(|a| sigv4::verify(access, secret, method, raw_path, raw_query, &a, &header))
+            };
             if !signed {
                 return error(req, 403, "SignatureDoesNotMatch", "signature check failed");
             }
         }
+        query.retain(|(k, _)| !PRESIGN_PARAMS.contains(&k.as_str()));
         let path = raw_path.trim_start_matches('/');
         let (bucket, raw_key) = path.split_once('/').unwrap_or((path, ""));
         if bucket != self.bucket {
@@ -212,18 +231,21 @@ impl Gateway {
         if key.starts_with(".rift/") {
             return error(req, 403, "AccessDenied", "reserved for rift");
         }
-        let query = parse_query(raw_query);
         let has = |name: &str| query.iter().any(|(k, _)| k == name);
         match method {
-            "GET" | "HEAD" if !key.is_empty() && query.is_empty() => match self.store.compacted(&key) {
-                Some(m) => self.serve_compacted(req, method, &m, header("range")),
-                None => {
-                    if blob_digest(&key).is_some() {
-                        self.reads.lock().unwrap().insert(key.clone(), unix_now());
-                    }
-                    self.forward(req, method, &key, &query, &headers, After::Nothing)
+            "GET" | "HEAD" if !key.is_empty() && query.is_empty() => {
+                if blob_digest(&key).is_some() {
+                    self.reads.lock().unwrap().insert(key.clone(), unix_now());
                 }
-            },
+                match self.store.compacted(&key) {
+                    Some(m) if !self.store.is_hot(&key) => self.serve_compacted(req, method, &m, header("range")),
+                    // stored as it is: a client following a presigned URL fetches it from the backend directly
+                    _ => match &self.redirect {
+                        Some(endpoint) if presigned && method == "GET" => self.redirect_to_backend(req, &key, endpoint),
+                        _ => self.forward(req, method, &key, &query, &headers, After::Nothing),
+                    },
+                }
+            }
             // ListObjects V1 or V2 (old registries stat files with V1 listings)
             "GET" if key.is_empty() && !query.iter().any(|(k, _)| BUCKET_SUBRESOURCES.contains(&k.as_str())) => {
                 self.forward(req, method, &key, &query, &headers, After::RewriteList)
@@ -316,13 +338,57 @@ impl Gateway {
         }
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(8);
         let (store, m, workers) = (self.store.clone(), m.clone(), self.workers);
+        // a full read also writes the bytes aside, to put the original back while the blob is in use
+        let copy = self.hot_copy && start == 0 && end == m.size && self.store.begin_hot_copy(&m.key);
         thread::spawn(move || {
-            if let Err(e) = store.stream(&m, start, end, workers, &mut |b| tx.send(b.to_vec()).is_ok()) {
+            let tmp = copy.then(|| {
+                let n = COPY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::env::temp_dir().join(format!("rift-copy-{}-{n}", std::process::id()))
+            });
+            let mut file = tmp.as_ref().and_then(|p| std::fs::File::create(p).ok().map(io::BufWriter::new));
+            let (mut sha, mut written) = (Sha256::new(), 0u64);
+            let result = store.stream(&m, start, end, workers, &mut |b| {
+                if let Some(f) = file.as_mut() {
+                    if f.write_all(b).is_ok() {
+                        sha.update(b);
+                        written += b.len() as u64;
+                    } else {
+                        file = None;
+                    }
+                }
+                tx.send(b.to_vec()).is_ok()
+            });
+            if let Err(e) = &result {
                 eprintln!("rift: rebuilding {}: {e:#}", m.key);
+            }
+            if copy {
+                let flushed = file.take().is_some_and(|mut f| f.flush().is_ok());
+                let whole = result.is_ok() && flushed && written == m.size && hex(&sha.finalize()) == m.sha256;
+                match (&tmp, whole) {
+                    (Some(p), true) => {
+                        if let Err(e) = store.finish_hot_copy(&m.key, p, m.size) {
+                            eprintln!("rift: putting {} back after a cold read: {e:#}", m.key);
+                        }
+                    }
+                    _ => store.abandon_hot_copy(&m.key),
+                }
+                if let Some(p) = &tmp {
+                    let _ = std::fs::remove_file(p);
+                }
             }
         });
         req.respond(Response::new(status, headers, ChannelReader { rx, buf: Vec::new(), at: 0 }, len, None))?;
         Ok(())
+    }
+
+    fn redirect_to_backend(&self, req: Request, key: &str, endpoint: &str) -> Result<()> {
+        match self.store.backend.presign_get(key, endpoint, 900) {
+            Ok(url) => {
+                req.respond(Response::empty(307).with_header(h("location", &url)))?;
+                Ok(())
+            }
+            Err(e) => error(req, 500, "InternalError", &format!("{e:#}")),
+        }
     }
 
     fn copy(&self, req: Request, key: &str, query: &[(String, String)], headers: &[(String, String)]) -> Result<()> {
@@ -394,18 +460,28 @@ pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, s: 
         match store.backend.list("") {
             Ok(objects) => {
                 let now = unix_now();
-                let cold: Vec<(String, String, u64)> = objects
-                    .into_iter()
-                    .filter(|o| !o.key.starts_with(".rift/"))
-                    .filter_map(|o| {
-                        let digest = blob_digest(&o.key)?;
-                        let read = reads.lock().unwrap().get(&o.key).copied().unwrap_or(0);
-                        (o.size >= s.min_size
-                            && store.compacted(&o.key).is_none()
-                            && now.saturating_sub(o.modified.max(read)) >= s.cold_after)
-                            .then_some((o.key, digest, o.modified))
-                    })
-                    .collect();
+                let (mut cold, mut cooling) = (Vec::new(), Vec::new());
+                for o in objects.into_iter().filter(|o| !o.key.starts_with(".rift/")) {
+                    let Some(digest) = blob_digest(&o.key) else { continue };
+                    let read = reads.lock().unwrap().get(&o.key).copied().unwrap_or(0);
+                    let idle = now.saturating_sub(o.modified.max(read)) >= s.cold_after;
+                    match store.compacted(&o.key) {
+                        // the original is back after a read: stub it again once nobody reads it
+                        Some(m) if o.size == m.size && o.size > 0 => {
+                            store.note_hot(&o.key, o.modified);
+                            if idle {
+                                cooling.push((o.key, o.etag));
+                            }
+                        }
+                        Some(_) => {}
+                        None if o.size >= s.min_size && idle => cold.push((o.key, digest, o.modified)),
+                        None => {}
+                    }
+                }
+                let cooled = cooling.iter().filter(|(k, etag)| store.cool(k, etag).map_err(|e| eprintln!("rift: cooling {k}: {e:#}")).is_ok()).count();
+                if cooled > 0 {
+                    eprintln!("rift: stubbed {cooled} hot copies again");
+                }
                 if !cold.is_empty() {
                     eprintln!("rift: compacting {} cold blobs", cold.len());
                     let started = std::time::Instant::now();
