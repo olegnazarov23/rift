@@ -75,7 +75,8 @@ copy after a cold read, presigned-URL redirects, and more than one gateway per b
 Tested locally against distribution 2.8.3 and MinIO with 3 redis and 3 postgres images (69 blobs,
 577.7 MB). The bucket held 238.6 MB, 58.7% less. Every blob read back through the registry was
 byte-exact, `docker pull` from scratch worked and the image ran, and registry garbage collection
-deleted compacted blobs cleanly.
+deleted compacted blobs cleanly. The same under Harbor v2.14.6 (its `storage_service.s3` pointed at
+rift): 3 images, 249.1 MB stored in 138.2 MB, every blob byte-exact, `docker pull` from scratch fine.
 
 ## Build
 
