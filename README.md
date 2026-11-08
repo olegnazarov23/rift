@@ -76,10 +76,11 @@ sign with the client keys, and set `redirect: disable: true`.
 - With `--redirect-endpoint`, a registry that redirects blob downloads to storage keeps doing so:
   blobs stored as they are get a presigned redirect to the backend, and only cold ones stream
   through rift.
-- `GET /-/healthz` for probes; `rift eject` puts every original back and removes rift's data.
+- `GET /-/metrics` (Prometheus: stored vs logical bytes, compaction, cold reads, GC) and
+  `GET /-/healthz`; `rift eject` puts every original back and removes rift's data.
 
 Running it for a pilot (Docker, Helm, registry settings, leaving): [docs/PILOT.md](docs/PILOT.md).
-Not done yet: more than one gateway per bucket, and metrics.
+Not done yet: more than one gateway per bucket.
 
 Tested locally against distribution 2.8.3 and MinIO with 3 redis and 3 postgres images (69 blobs,
 577.7 MB). The bucket held 238.6 MB, 58.7% less. Every blob read back through the registry was

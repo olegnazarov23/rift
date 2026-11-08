@@ -2,6 +2,7 @@
 
 mod cas;
 mod gateway;
+mod metrics;
 mod registry;
 mod s3;
 mod sigv4;

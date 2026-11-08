@@ -106,9 +106,15 @@ endpoint as well as the registry.
 
 ## 6. Watching it
 
+- `GET /-/metrics` is Prometheus format (the chart adds scrape annotations). The ones that matter:
+  - `rift_bucket_logical_bytes`, `rift_bucket_stored_bytes` and `rift_bucket_saved_ratio`: what the
+    registry sees against what's stored, updated on every compactor round. This is the saving.
+  - `rift_compactions_total`, `rift_compaction_failures_total`: progress, and blobs left as they were.
+  - `rift_cold_reads_total`, `rift_cold_read_seconds_total`, `rift_hot_copies_made_total`,
+    `rift_redirects_total`: how pulls are served.
+  - `rift_backend_errors_total`, `rift_cold_read_errors_total`: should stay at zero.
 - `GET /-/healthz` answers `{"status":"ok","compacted":N}`.
 - The log has a line for every compaction batch, garbage collection, and hot copy stubbed again.
-- Compare the bucket's size before and after with what `rift scan` predicted.
 
 ## 7. Leaving
 

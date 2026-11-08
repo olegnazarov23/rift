@@ -53,6 +53,10 @@ service:
   type: ClusterIP
   port: 9100
 
+# Prometheus metrics are served at /-/metrics on the same port.
+metrics:
+  prometheusAnnotations: true
+
 nodeSelector: {}
 tolerations: []
 affinity: {}

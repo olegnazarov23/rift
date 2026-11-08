@@ -703,6 +703,7 @@ impl Store {
                 Some((0, etag)) if self.compacted(key).is_some() => {
                     self.backend.put_file(key, std::fs::File::open(file)?, size, &[("if-match".into(), etag)])?;
                     self.hot.lock().unwrap().insert(key.to_string(), unix_now());
+                    crate::metrics::add(&crate::metrics::METRICS.hot_copies_made, 1);
                 }
                 Some((n, _)) if n == size => self.note_hot(key, unix_now()),
                 _ => {}
@@ -775,6 +776,22 @@ impl Store {
             }
         }
         Ok((restored, failed, bytes))
+    }
+
+    /// Publishes counts and sizes for /-/metrics. Call it between compactions (it takes the packer).
+    pub fn publish_totals(&self) {
+        use crate::metrics::{METRICS, set};
+        let (blobs, bytes) = {
+            let c = self.compacted.read().unwrap();
+            (c.len() as u64, c.values().map(|m| m.size).sum::<u64>())
+        };
+        set(&METRICS.compacted_blobs, blobs);
+        set(&METRICS.compacted_logical_bytes, bytes);
+        set(&METRICS.hot_copies, self.hot.lock().unwrap().len() as u64);
+        let packer = self.packer.lock().unwrap();
+        set(&METRICS.packs, packer.packs.len() as u64);
+        set(&METRICS.pack_bytes, packer.packs.values().map(|p| p.1).sum());
+        set(&METRICS.retired_pack_bytes, self.retired.lock().unwrap().iter().map(|r| r.2).sum());
     }
 
     pub fn gc_due(&self) -> bool {

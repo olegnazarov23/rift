@@ -18,6 +18,11 @@ spec:
         {{- include "rift.selector" . | nindent 8 }}
       annotations:
         checksum/config: {{ toJson .Values | sha256sum }}
+        {{- if .Values.metrics.prometheusAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /-/metrics
+        prometheus.io/port: "9100"
+        {{- end }}
     spec:
       securityContext:
         runAsNonRoot: true

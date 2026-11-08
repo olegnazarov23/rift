@@ -16,6 +16,7 @@ use tiny_http::{Header, Request, Response, Server, StatusCode};
 
 use crate::{
     cas::{Manifest, Store, blob_digest},
+    metrics::{METRICS, add, set},
     s3::{self, Backend, decode_aws_chunked, xml_all, xml_escape, xml_unescape},
     sigv4::{self, hex, parse_query, unix_now, uri_decode},
 };
@@ -204,6 +205,11 @@ impl Gateway {
     fn route(&self, req: Request, method: &str, url: &str) -> Result<()> {
         let (raw_path, raw_query) = url.split_once('?').unwrap_or((url, ""));
         // no bucket name can start with '-'
+        if raw_path == "/-/metrics" {
+            let out = Response::from_data(crate::metrics::render());
+            req.respond(out.with_header(h("content-type", "text/plain; version=0.0.4")))?;
+            return Ok(());
+        }
         if raw_path == "/-/healthz" {
             let body = format!("{{\"status\":\"ok\",\"compacted\":{}}}\n", self.store.len());
             req.respond(Response::from_data(body).with_header(h("content-type", "application/json")))?;
@@ -295,11 +301,18 @@ impl Gateway {
             after = After::Forget(xml_all(&String::from_utf8_lossy(&body), "Key").into_iter().map(xml_unescape).collect());
         }
         let rest = if key.is_empty() { String::new() } else { Backend::key_path(key) };
+        add(&METRICS.passthrough, 1);
         let resp = match self.store.backend.send(method, &rest, query, &pass_headers(headers, chunked), body) {
             Ok(r) => r,
-            Err(e) => return error(req, 502, "BadGateway", &format!("{e:#}")),
+            Err(e) => {
+                add(&METRICS.backend_errors, 1);
+                return error(req, 502, "BadGateway", &format!("{e:#}"));
+            }
         };
         let status = resp.status().as_u16();
+        if status >= 500 {
+            add(&METRICS.backend_errors, 1);
+        }
         let back = back_headers(&resp);
         let ok = (200..300).contains(&status);
         match after {
@@ -346,7 +359,10 @@ impl Gateway {
         let (store, m, workers) = (self.store.clone(), m.clone(), self.workers);
         // a full read also writes the bytes aside, to put the original back while the blob is in use
         let copy = self.hot_copy && start == 0 && end == m.size && self.store.begin_hot_copy(&m.key);
+        add(&METRICS.cold_reads, 1);
         thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut sent = 0u64;
             let tmp = copy.then(|| {
                 let n = COPY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 std::env::temp_dir().join(format!("rift-copy-{}-{n}", std::process::id()))
@@ -362,9 +378,16 @@ impl Gateway {
                         file = None;
                     }
                 }
-                tx.send(b.to_vec()).is_ok()
+                let ok = tx.send(b.to_vec()).is_ok();
+                if ok {
+                    sent += b.len() as u64;
+                }
+                ok
             });
+            add(&METRICS.cold_read_bytes, sent);
+            add(&METRICS.cold_read_ms, started.elapsed().as_millis() as u64);
             if let Err(e) = &result {
+                add(&METRICS.cold_read_errors, 1);
                 eprintln!("rift: rebuilding {}: {e:#}", m.key);
             }
             if copy {
@@ -390,6 +413,7 @@ impl Gateway {
     fn redirect_to_backend(&self, req: Request, key: &str, endpoint: &str) -> Result<()> {
         match self.store.backend.presign_get(key, endpoint, 900) {
             Ok(url) => {
+                add(&METRICS.redirects, 1);
                 req.respond(Response::empty(307).with_header(h("location", &url)))?;
                 Ok(())
             }
@@ -466,6 +490,16 @@ pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, s: 
         match store.backend.list("") {
             Ok(objects) => {
                 let now = unix_now();
+                let (mut logical, mut stored) = (0u64, 0u64);
+                for o in &objects {
+                    stored += o.size;
+                    if !o.key.starts_with(".rift/") {
+                        logical += store.compacted(&o.key).map_or(o.size, |m| m.size);
+                    }
+                }
+                set(&METRICS.bucket_logical_bytes, logical);
+                set(&METRICS.bucket_stored_bytes, stored);
+                set(&METRICS.bucket_listed_at, now);
                 let (mut cold, mut cooling) = (Vec::new(), Vec::new());
                 for o in objects.into_iter().filter(|o| !o.key.starts_with(".rift/")) {
                     let Some(digest) = blob_digest(&o.key) else { continue };
@@ -486,12 +520,17 @@ pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, s: 
                 }
                 let cooled = cooling.iter().filter(|(k, etag)| store.cool(k, etag).map_err(|e| eprintln!("rift: cooling {k}: {e:#}")).is_ok()).count();
                 if cooled > 0 {
+                    add(&METRICS.hot_copies_cooled, cooled as u64);
                     eprintln!("rift: stubbed {cooled} hot copies again");
                 }
                 if !cold.is_empty() {
                     eprintln!("rift: compacting {} cold blobs", cold.len());
                     let started = std::time::Instant::now();
                     let (done, bytes) = store.compact(&cold, s.threads);
+                    add(&METRICS.compactions, done as u64);
+                    add(&METRICS.compacted_bytes, bytes);
+                    add(&METRICS.compaction_ms, started.elapsed().as_millis() as u64);
+                    add(&METRICS.compaction_failures, (cold.len() - done) as u64);
                     eprintln!(
                         "rift: compacted {done} of {} blobs ({:.1} MB) in {:.1}s",
                         cold.len(),
@@ -504,7 +543,14 @@ pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, s: 
         }
         if first || store.gc_due() {
             first = false;
-            match store.gc(s.rewrite_below, s.grace) {
+            let report = store.gc(s.rewrite_below, s.grace);
+            if let Ok(r) = &report {
+                add(&METRICS.gc_runs, 1);
+                add(&METRICS.gc_deleted_packs, r.deleted as u64);
+                add(&METRICS.gc_deleted_bytes, r.deleted_bytes);
+                add(&METRICS.gc_moved_chunks, r.moved as u64);
+            }
+            match report {
                 Ok(r) if r.deleted + r.retired + r.rewritten > 0 => eprintln!(
                     "rift: gc: deleted {} packs ({:.1} MB); retired {} unused and rewrote {} sparse ({} chunks moved)",
                     r.deleted,
@@ -517,6 +563,7 @@ pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, s: 
                 Err(e) => eprintln!("rift: gc: {e:#}"),
             }
         }
+        store.publish_totals();
     }
 }
 
