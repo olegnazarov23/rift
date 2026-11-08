@@ -988,6 +988,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redb"
+version = "4.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b317ef681e18f6091efbfab532eaf924a135c492d9d0299d0fbfae07e92a39b"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1040,6 +1049,7 @@ dependencies = [
  "httpdate",
  "lepton_jpeg",
  "preflate-rs",
+ "redb",
  "reqwest",
  "serde_json",
  "sha2",

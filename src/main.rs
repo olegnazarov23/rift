@@ -2,6 +2,7 @@
 
 mod cas;
 mod gateway;
+mod index;
 mod metrics;
 mod registry;
 mod s3;
@@ -59,6 +60,9 @@ struct EjectArgs {
     region: String,
     #[arg(long)]
     threads: Option<usize>,
+    /// The gateway's --state-dir, if it set one
+    #[arg(long)]
+    state_dir: Option<std::path::PathBuf>,
     /// Do it; without this, only say what would happen
     #[arg(long)]
     yes: bool,
@@ -68,7 +72,7 @@ fn eject(args: &EjectArgs) -> Result<()> {
     let env = |k: &str| std::env::var(k).with_context(|| format!("set {k}"));
     let backend = s3::Backend::new(&args.backend, &args.bucket, &args.region, env("RIFT_BACKEND_ACCESS_KEY")?, env("RIFT_BACKEND_SECRET_KEY")?)?;
     let threads = args.threads.unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
-    let store = cas::Store::open(Arc::new(backend), 19, 64, threads, 64 << 20)?;
+    let store = cas::Store::open(Arc::new(backend), &state_dir(&args.state_dir, &args.bucket), 19, 64, threads, 64 << 20)?;
     if !args.yes {
         println!("{} compacted blobs in {}/{} would be put back as they were, then rift's packs deleted.", store.len(), args.backend, args.bucket);
         println!("Stop the gateway first, then run again with --yes.");
@@ -128,6 +132,13 @@ struct GatewayArgs {
     /// Memory for manifests loaded from the bucket, in MB
     #[arg(long, default_value_t = 512)]
     manifest_cache_mb: usize,
+    /// Where the chunk index lives (rebuilt from the bucket if lost); default: a temp directory
+    #[arg(long)]
+    state_dir: Option<std::path::PathBuf>,
+}
+
+fn state_dir(given: &Option<std::path::PathBuf>, bucket: &str) -> std::path::PathBuf {
+    given.clone().unwrap_or_else(|| std::env::temp_dir().join("rift").join(bucket))
 }
 
 /// "30s", "10m", "12h", "7d" or plain seconds.
@@ -156,7 +167,8 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
         bail!("set RIFT_CLIENT_ACCESS_KEY and RIFT_CLIENT_SECRET_KEY to listen beyond localhost");
     }
     let threads = args.threads.unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
-    let store = Arc::new(cas::Store::open(Arc::new(backend), args.pack_level, 64, threads, args.manifest_cache_mb << 20)?);
+    let dir = state_dir(&args.state_dir, bucket);
+    let store = Arc::new(cas::Store::open(Arc::new(backend), &dir, args.pack_level, 64, threads, args.manifest_cache_mb << 20)?);
     eprintln!(
         "rift gateway on {} for {}/{bucket}: {} compacted blobs, compacting after {} cold, client signatures {}",
         args.listen,

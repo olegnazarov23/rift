@@ -44,6 +44,7 @@ spec:
             - --pack-level={{ .Values.compaction.packLevel }}
             - --gc-grace={{ .Values.gc.grace }}
             - --gc-rewrite-below={{ .Values.gc.rewriteBelow }}
+            - --state-dir=/var/lib/rift
             {{- with .Values.backend.redirectEndpoint }}
             - --redirect-endpoint={{ . }}
             {{- end }}
@@ -79,10 +80,20 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: state
+              mountPath: /var/lib/rift
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: {{ .Values.tmp.sizeLimit }}
+        - name: state
+          {{- if .Values.state.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "rift.fullname" . }}-state
+          {{- else }}
+          emptyDir:
+            sizeLimit: {{ .Values.state.size }}
+          {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

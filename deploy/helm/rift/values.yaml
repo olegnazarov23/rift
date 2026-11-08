@@ -49,6 +49,14 @@ resources:
 tmp:
   sizeLimit: 20Gi
 
+# The chunk index (about 60 bytes per stored chunk). It's rebuilt from the bucket when lost, so an
+# emptyDir works; a persistent volume saves the rebuild on restarts of a large registry.
+state:
+  size: 10Gi
+  persistence:
+    enabled: false
+    storageClass: ""
+
 service:
   type: ClusterIP
   port: 9100

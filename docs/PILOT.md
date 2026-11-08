@@ -21,7 +21,9 @@ On our tests: 64% less on official Docker Hub images, 79% on 30 consecutive CI b
 - The bucket, and a key for rift with GetObject, PutObject, DeleteObject, ListBucket and the
   multipart actions on it. rift keeps its data in the same bucket, under `.rift/`.
 - Somewhere to run rift next to the registry, in the bucket's region: 2 or more cores, 4–8 GB of
-  memory, and temp space for your largest layer.
+  memory, temp space for your largest layer, and local disk for the chunk index (about 60 bytes per
+  stored chunk, roughly 1 GB per TB stored). The index is rebuilt from the bucket if it's lost; keep
+  it on a persistent volume (`state.persistence.enabled` in the chart) to skip that on restarts.
 
 ## 3. Run rift
 
