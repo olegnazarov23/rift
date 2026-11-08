@@ -24,10 +24,13 @@ spec:
         prometheus.io/port: "9100"
         {{- end }}
     spec:
+      serviceAccountName: {{ include "rift.serviceAccountName" . }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
+        # lets rift read the IRSA token and write its volumes
+        fsGroup: 65532
       containers:
         - name: rift
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

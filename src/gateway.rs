@@ -751,12 +751,14 @@ fn sweep_spills(dir: &std::path::Path) {
     }
 }
 
-/// Every `interval`: compacts cold blobs, then reclaims chunks of deleted ones (always on the first
+/// Every `interval` (the first round within a minute of starting): lists the bucket, stubs idle hot
+/// copies again, compacts cold blobs, then reclaims chunks of deleted ones (always on the first
 /// round, to clear packs an interrupted run left behind).
 pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, s: Schedule) {
-    let mut first = true;
+    let (mut first, mut wait) = (true, s.interval.min(Duration::from_secs(60)));
     loop {
-        thread::sleep(s.interval);
+        thread::sleep(wait);
+        wait = s.interval;
         sweep_spills(&std::env::temp_dir());
         match store.backend.list("") {
             Ok(objects) => {

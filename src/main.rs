@@ -1,6 +1,7 @@
 //! rift: byte-exact recompression for container registries and object storage.
 
 mod cas;
+mod creds;
 mod gateway;
 mod index;
 mod metrics;
@@ -69,8 +70,7 @@ struct EjectArgs {
 }
 
 fn eject(args: &EjectArgs) -> Result<()> {
-    let env = |k: &str| std::env::var(k).with_context(|| format!("set {k}"));
-    let backend = s3::Backend::new(&args.backend, &args.bucket, &args.region, env("RIFT_BACKEND_ACCESS_KEY")?, env("RIFT_BACKEND_SECRET_KEY")?)?;
+    let backend = s3::Backend::new(&args.backend, &args.bucket, &args.region, creds::Credentials::from_env(&args.region)?)?;
     let threads = args.threads.unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
     let store = cas::Store::open(Arc::new(backend), &state_dir(&args.state_dir, &args.bucket), 19, 64, threads, 64 << 20)?;
     if !args.yes {
@@ -105,8 +105,9 @@ struct GatewayArgs {
     /// Compact blobs nobody has written or read for this long (30s, 10m, 12h, 7d)
     #[arg(long, default_value = "7d")]
     cold_after: String,
-    /// How often to look for cold blobs
-    #[arg(long, default_value = "1m")]
+    /// How often to list the bucket for cold blobs, hot copies to stub again and chunks to reclaim
+    /// (each listing is one LIST request per 1,000 objects)
+    #[arg(long, default_value = "1h")]
     interval: String,
     /// Smallest blob worth compacting, in MB
     #[arg(long, default_value_t = 1.0)]
@@ -173,9 +174,8 @@ fn seconds(s: &str) -> Result<u64> {
 }
 
 fn gateway(args: &GatewayArgs) -> Result<()> {
-    let env = |k: &str| std::env::var(k).with_context(|| format!("set {k}"));
     let bucket = args.backend_bucket.as_deref().unwrap_or(&args.bucket);
-    let backend = s3::Backend::new(&args.backend, bucket, &args.region, env("RIFT_BACKEND_ACCESS_KEY")?, env("RIFT_BACKEND_SECRET_KEY")?)?;
+    let backend = s3::Backend::new(&args.backend, bucket, &args.region, creds::Credentials::from_env(&args.region)?)?;
     let client_keys = match (std::env::var("RIFT_CLIENT_ACCESS_KEY"), std::env::var("RIFT_CLIENT_SECRET_KEY")) {
         (Ok(a), Ok(s)) => Some((a, s)),
         _ => None,
@@ -188,13 +188,15 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
     let dir = state_dir(&args.state_dir, bucket);
     let store = Arc::new(cas::Store::open(Arc::new(backend), &dir, args.pack_level, 64, threads, args.manifest_cache_mb << 20)?);
     eprintln!(
-        "rift gateway on {}{} for {}/{bucket}: {} compacted blobs, compacting after {} cold, client signatures {}",
+        "rift gateway on {}{} for {}/{bucket}: {} compacted blobs, compacting after {} cold (looking every {}), client signatures {}, bucket keys from {}",
         if args.tls_cert.is_some() { "https://" } else { "" },
         args.listen,
         args.backend,
         store.len(),
         args.cold_after,
-        if client_keys.is_some() { "checked" } else { "not checked" }
+        args.interval,
+        if client_keys.is_some() { "checked" } else { "not checked" },
+        store.backend.keys_from()
     );
     store.publish_totals();
     let reads = Arc::new(Mutex::new(std::collections::HashMap::new()));

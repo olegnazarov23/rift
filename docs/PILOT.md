@@ -18,8 +18,9 @@ On our tests: 64% less on official Docker Hub images, 79% on 30 consecutive CI b
 
 - A registry that stores in S3: distribution (the Docker registry), Harbor, GitLab self-managed,
   or anything else with an S3 storage setting.
-- The bucket, and a key for rift with GetObject, PutObject, DeleteObject, ListBucket and the
-  multipart actions on it. rift keeps its data in the same bucket, under `.rift/`.
+- The bucket, and access to it for rift: an IAM role (IRSA, EKS Pod Identity, ECS task role or
+  EC2 instance profile) or a key, with the policy below. rift keeps its data in the same bucket,
+  under `.rift/`.
 - Somewhere to run rift next to the registry, in the bucket's region: 2 or more cores, 4–8 GB of
   memory, temp space for your largest layer, and local disk for the chunk index (about 60 bytes per
   stored chunk, roughly 1 GB per TB stored). The index is rebuilt from the bucket if it's lost; keep
@@ -32,8 +33,28 @@ Build the image with `docker build -t rift:0.1.0 .` and push it where your clust
 
 | Variable | What it is |
 |---|---|
-| `RIFT_BACKEND_ACCESS_KEY`, `RIFT_BACKEND_SECRET_KEY` | rift's key to the bucket |
+| `RIFT_BACKEND_ACCESS_KEY`, `RIFT_BACKEND_SECRET_KEY` | rift's key to the bucket; leave them out to use an IAM role |
 | `RIFT_CLIENT_ACCESS_KEY`, `RIFT_CLIENT_SECRET_KEY` | keys you make up; the registry signs its requests to rift with them |
+
+**IAM roles instead of a key.** Without `RIFT_BACKEND_*`, rift finds credentials the way AWS's SDKs
+do: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`), then IRSA, EKS Pod
+Identity or ECS, then the EC2 instance role. Temporary keys are fetched again 15 minutes before
+they expire. With the chart, leave `credentials.backendAccessKey` empty, and either annotate the
+service account for IRSA (`--set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<account>:role/rift`)
+or add a Pod Identity association for it. The role or key needs:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+     "Resource": "arn:aws:s3:::my-registry"},
+    {"Effect": "Allow",
+     "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
+     "Resource": "arn:aws:s3:::my-registry/*"}
+  ]
+}
+```
 
 With Helm:
 
@@ -134,8 +155,8 @@ network: signatures stop tampering and replays, but blob contents cross the netw
 
 **Keys and network**
 
-- The backend key is the only one that reaches the bucket itself; scope it to that bucket. The
-  client keys only work at rift. Rotate them by changing the Secret and the registry's config
+- Prefer an IAM role to a backend key; either way it's the only thing that reaches the bucket
+  itself, so scope it to that bucket (the policy in section 3). The client keys only work at rift. Rotate them by changing the Secret and the registry's config
   together; rift reads keys at start.
 - Only the registry needs to reach rift, plus the machines that pull if redirects are on (presigned
   URLs point at rift). Admit just those with a NetworkPolicy or security group; the limits above
@@ -160,6 +181,10 @@ network: signatures stop tampering and replays, but blob contents cross the netw
 - **A pull of a compacted blob** is rebuilt as it streams (first byte in under a second). rift then
   puts the original back in the bucket until the blob goes cold again, so repeat pulls are full
   speed.
+- **How often rift looks:** every `--interval` (default 1 hour) it lists the bucket to find cold
+  blobs, stub idle hot copies again and reclaim deleted chunks. Each listing is one LIST request
+  per 1,000 objects: on S3 Standard, about $3.60 a month per million objects at the default. Raise
+  `--interval` for buckets with tens of millions of objects.
 - **Deletes and registry garbage collection** work as before. rift drops the deleted blobs and
   reclaims their packs after `--gc-grace` (default 10 minutes).
 
@@ -167,7 +192,7 @@ network: signatures stop tampering and replays, but blob contents cross the netw
 
 - `GET /-/metrics` is Prometheus format (the chart adds scrape annotations). The ones that matter:
   - `rift_bucket_logical_bytes`, `rift_bucket_stored_bytes` and `rift_bucket_saved_ratio`: what the
-    registry sees against what's stored, updated on every compactor round. This is the saving.
+    registry sees against what's stored, updated on every compactor round (hourly by default). This is the saving.
   - `rift_compactions_total`, `rift_compaction_failures_total`: progress, and blobs left as they were.
   - `rift_cold_reads_total`, `rift_cold_read_seconds_total`, `rift_hot_copies_made_total`,
     `rift_redirects_total`: how pulls are served.

@@ -20,3 +20,11 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "rift.secret" -}}
 {{- .Values.credentials.existingSecret | default (include "rift.fullname" .) -}}
 {{- end -}}
+
+{{- define "rift.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create -}}
+{{- .Values.serviceAccount.name | default (include "rift.fullname" .) -}}
+{{- else -}}
+{{- .Values.serviceAccount.name | default "default" -}}
+{{- end -}}
+{{- end -}}

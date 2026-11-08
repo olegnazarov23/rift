@@ -12,9 +12,10 @@ backend:
   # blobs stored as they are then go straight to S3 and only cold ones stream through rift.
   redirectEndpoint: ""
 
-# Keys: "backend" lets rift read and write the bucket; "client" is what the registry signs with
-# when it talks to rift. Use an existing Secret with RIFT_BACKEND_ACCESS_KEY,
-# RIFT_BACKEND_SECRET_KEY, RIFT_CLIENT_ACCESS_KEY and RIFT_CLIENT_SECRET_KEY, or fill these in.
+# Keys: "client" is what the registry signs with when it talks to rift (required). "backend" lets
+# rift read and write the bucket; leave it empty to use an IAM role instead (see serviceAccount).
+# Use an existing Secret with RIFT_CLIENT_ACCESS_KEY and RIFT_CLIENT_SECRET_KEY (and optionally
+# RIFT_BACKEND_ACCESS_KEY and RIFT_BACKEND_SECRET_KEY), or fill these in.
 credentials:
   existingSecret: ""
   backendAccessKey: ""
@@ -25,7 +26,8 @@ credentials:
 compaction:
   # compact blobs nobody has written or read for this long
   coldAfter: 7d
-  interval: 1m
+  # each round lists the bucket: one LIST request per 1,000 objects
+  interval: 1h
   minSizeMB: 1
   packLevel: 19
   # put a blob's original bytes back after a cold read, until it goes cold again
@@ -35,6 +37,14 @@ gc:
   # how long a pack no blob uses stays readable before it's deleted
   grace: 10m
   rewriteBelow: 0.5
+
+# On EKS, give rift an IAM role instead of backend keys: annotate for IRSA
+# (eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/rift) or add a Pod Identity association
+# for this service account.
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
 
 # Cold reads rebuild on these cores; compaction uses them too.
 threads: ""

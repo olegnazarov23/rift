@@ -67,7 +67,8 @@ predicts 522.7 MB: faster, and pessimistic by about 4 points.
     rift gateway --backend https://s3.us-east-1.amazonaws.com --bucket my-registry --cold-after 7d
 
 Point the registry's S3 storage at it (distribution, Harbor and GitLab all take a `regionendpoint`),
-sign with the client keys, and set `redirect: disable: true`.
+sign with the client keys, and set `redirect: disable: true`. Instead of backend keys, rift can use
+an AWS role: IRSA, EKS Pod Identity, ECS task roles or EC2 instance profiles.
 
 - Requests pass through to the bucket, re-signed with the backend keys.
 - Blobs nobody has written or read for `--cold-after` are compacted. preflate unpacks them, the

@@ -3,7 +3,10 @@
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::{Client, Response};
 
-use crate::sigv4::{Seed, amz_date, canonical_query, chunk_signature, civil, days_from_civil, sign, unix_now, uri_encode};
+use crate::{
+    creds::Credentials,
+    sigv4::{Seed, amz_date, canonical_query, chunk_signature, civil, days_from_civil, sign, unix_now, uri_encode},
+};
 
 pub struct Backend {
     client: Client,
@@ -11,8 +14,7 @@ pub struct Backend {
     host: String,
     pub bucket: String,
     region: String,
-    access_key: String,
-    secret_key: String,
+    creds: Credentials,
 }
 
 pub struct Object {
@@ -23,7 +25,7 @@ pub struct Object {
 }
 
 impl Backend {
-    pub fn new(endpoint: &str, bucket: &str, region: &str, access_key: String, secret_key: String) -> Result<Self> {
+    pub fn new(endpoint: &str, bucket: &str, region: &str, creds: Credentials) -> Result<Self> {
         let url = reqwest::Url::parse(endpoint).context("backend endpoint")?;
         let host = url.host_str().context("backend endpoint has no host")?;
         let host = url.port().map_or_else(|| host.to_string(), |p| format!("{host}:{p}"));
@@ -33,9 +35,13 @@ impl Backend {
             host,
             bucket: bucket.to_string(),
             region: region.to_string(),
-            access_key,
-            secret_key,
+            creds,
         })
+    }
+
+    /// Where the bucket keys come from, for the log.
+    pub fn keys_from(&self) -> &str {
+        self.creds.describe()
     }
 
     /// Sends a signed request. `rest` is the encoded path after the bucket ("" or "/key");
@@ -51,19 +57,22 @@ impl Backend {
         let path = format!("/{}{rest}", self.bucket);
         let q = canonical_query(query);
         let date = amz_date(unix_now());
+        let keys = self.creds.keys()?;
         let mut signed: Vec<(&str, &str)> =
             vec![("host", &self.host), ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("x-amz-date", &date)];
+        if let Some(token) = &keys.token {
+            signed.push(("x-amz-security-token", token));
+        }
         signed.extend(
             headers
                 .iter()
                 .filter(|(k, _)| k.starts_with("x-amz-") && k != "x-amz-content-sha256" && k != "x-amz-date")
                 .map(|(k, v)| (k.as_str(), v.as_str())),
         );
-        let (sig, signed_list) =
-            sign(&self.secret_key, &self.region, &date, method, &path, &q, &signed, "UNSIGNED-PAYLOAD");
+        let (sig, signed_list) = sign(&keys.secret, &self.region, &date, method, &path, &q, &signed, "UNSIGNED-PAYLOAD");
         let auth = format!(
             "AWS4-HMAC-SHA256 Credential={}/{}/{}/s3/aws4_request, SignedHeaders={signed_list}, Signature={sig}",
-            self.access_key,
+            keys.access,
             &date[..8],
             self.region
         );
@@ -74,6 +83,9 @@ impl Backend {
             .header("authorization", auth)
             .header("x-amz-date", &date)
             .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        if let Some(token) = &keys.token {
+            req = req.header("x-amz-security-token", token);
+        }
         for (k, v) in headers {
             req = req.header(k.as_str(), v.as_str());
         }
@@ -137,15 +149,19 @@ impl Backend {
         let host = url.port().map_or_else(|| host.to_string(), |p| format!("{host}:{p}"));
         let path = format!("/{}{}", self.bucket, Self::key_path(key));
         let date = amz_date(unix_now());
-        let params = vec![
+        let keys = self.creds.keys()?;
+        let mut params = vec![
             ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
-            ("X-Amz-Credential".to_string(), format!("{}/{}/{}/s3/aws4_request", self.access_key, &date[..8], self.region)),
+            ("X-Amz-Credential".to_string(), format!("{}/{}/{}/s3/aws4_request", keys.access, &date[..8], self.region)),
             ("X-Amz-Date".to_string(), date.clone()),
             ("X-Amz-Expires".to_string(), expires.to_string()),
             ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
         ];
+        if let Some(token) = &keys.token {
+            params.push(("X-Amz-Security-Token".to_string(), token.clone()));
+        }
         let q = canonical_query(&params);
-        let (sig, _) = sign(&self.secret_key, &self.region, &date, "GET", &path, &q, &[("host", &host)], "UNSIGNED-PAYLOAD");
+        let (sig, _) = sign(&keys.secret, &self.region, &date, "GET", &path, &q, &[("host", &host)], "UNSIGNED-PAYLOAD");
         Ok(format!("{}{path}?{q}&X-Amz-Signature={sig}", endpoint.trim_end_matches('/')))
     }
 
