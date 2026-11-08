@@ -387,6 +387,7 @@ pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, col
         let now = unix_now();
         let cold: Vec<(String, String, u64)> = objects
             .into_iter()
+            .filter(|o| !o.key.starts_with(".rift/"))
             .filter_map(|o| {
                 let digest = blob_digest(&o.key)?;
                 let read = reads.lock().unwrap().get(&o.key).copied().unwrap_or(0);
