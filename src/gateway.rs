@@ -373,40 +373,68 @@ impl Gateway {
     }
 }
 
-/// Compacts blobs nobody has written or read for `cold_after` seconds, every `interval`.
-pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, cold_after: u64, min_size: u64, interval: Duration, threads: usize) {
+pub struct Schedule {
+    /// compact blobs nobody has written or read for this many seconds
+    pub cold_after: u64,
+    pub min_size: u64,
+    pub interval: Duration,
+    pub threads: usize,
+    /// rewrite packs with less than this fraction of their bytes live
+    pub rewrite_below: f64,
+    /// seconds a retired pack stays readable before it's deleted
+    pub grace: u64,
+}
+
+/// Every `interval`: compacts cold blobs, then reclaims chunks of deleted ones (always on the first
+/// round, to clear packs an interrupted run left behind).
+pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, s: Schedule) {
+    let mut first = true;
     loop {
-        thread::sleep(interval);
-        let objects = match store.backend.list("") {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("rift: compactor can't list the bucket: {e:#}");
-                continue;
+        thread::sleep(s.interval);
+        match store.backend.list("") {
+            Ok(objects) => {
+                let now = unix_now();
+                let cold: Vec<(String, String, u64)> = objects
+                    .into_iter()
+                    .filter(|o| !o.key.starts_with(".rift/"))
+                    .filter_map(|o| {
+                        let digest = blob_digest(&o.key)?;
+                        let read = reads.lock().unwrap().get(&o.key).copied().unwrap_or(0);
+                        (o.size >= s.min_size
+                            && store.compacted(&o.key).is_none()
+                            && now.saturating_sub(o.modified.max(read)) >= s.cold_after)
+                            .then_some((o.key, digest, o.modified))
+                    })
+                    .collect();
+                if !cold.is_empty() {
+                    eprintln!("rift: compacting {} cold blobs", cold.len());
+                    let started = std::time::Instant::now();
+                    let (done, bytes) = store.compact(&cold, s.threads);
+                    eprintln!(
+                        "rift: compacted {done} of {} blobs ({:.1} MB) in {:.1}s",
+                        cold.len(),
+                        bytes as f64 / 1e6,
+                        started.elapsed().as_secs_f64()
+                    );
+                }
             }
-        };
-        let now = unix_now();
-        let cold: Vec<(String, String, u64)> = objects
-            .into_iter()
-            .filter(|o| !o.key.starts_with(".rift/"))
-            .filter_map(|o| {
-                let digest = blob_digest(&o.key)?;
-                let read = reads.lock().unwrap().get(&o.key).copied().unwrap_or(0);
-                (o.size >= min_size && store.compacted(&o.key).is_none() && now.saturating_sub(o.modified.max(read)) >= cold_after)
-                    .then_some((o.key, digest, o.modified))
-            })
-            .collect();
-        if cold.is_empty() {
-            continue;
+            Err(e) => eprintln!("rift: compactor can't list the bucket: {e:#}"),
         }
-        eprintln!("rift: compacting {} cold blobs", cold.len());
-        let started = std::time::Instant::now();
-        let (done, bytes) = store.compact(&cold, threads);
-        eprintln!(
-            "rift: compacted {done} of {} blobs ({:.1} MB) in {:.1}s",
-            cold.len(),
-            bytes as f64 / 1e6,
-            started.elapsed().as_secs_f64()
-        );
+        if first || store.gc_due() {
+            first = false;
+            match store.gc(s.rewrite_below, s.grace) {
+                Ok(r) if r.deleted + r.retired + r.rewritten > 0 => eprintln!(
+                    "rift: gc: deleted {} packs ({:.1} MB); retired {} unused and rewrote {} sparse ({} chunks moved)",
+                    r.deleted,
+                    r.deleted_bytes as f64 / 1e6,
+                    r.retired,
+                    r.rewritten,
+                    r.moved
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!("rift: gc: {e:#}"),
+            }
+        }
     }
 }
 

@@ -75,6 +75,12 @@ struct GatewayArgs {
     /// Threads for compaction and for each rebuild (default: all cores)
     #[arg(long)]
     threads: Option<usize>,
+    /// How long a pack no blob uses stays readable before it's deleted
+    #[arg(long, default_value = "10m")]
+    gc_grace: String,
+    /// Rewrite packs with less than this fraction of their bytes still in use
+    #[arg(long, default_value_t = 0.5)]
+    gc_rewrite_below: f64,
 }
 
 /// "30s", "10m", "12h", "7d" or plain seconds.
@@ -113,10 +119,17 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
         if client_keys.is_some() { "checked" } else { "not checked" }
     );
     let reads = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let (cold, every, min) = (seconds(&args.cold_after)?, seconds(&args.interval)?, (args.min_size_mb * 1e6) as u64);
+    let schedule = gateway::Schedule {
+        cold_after: seconds(&args.cold_after)?,
+        min_size: (args.min_size_mb * 1e6) as u64,
+        interval: std::time::Duration::from_secs(seconds(&args.interval)?),
+        threads,
+        rewrite_below: args.gc_rewrite_below,
+        grace: seconds(&args.gc_grace)?,
+    };
     {
         let (store, reads) = (store.clone(), reads.clone());
-        thread::spawn(move || gateway::compactor(store, reads, cold, min, std::time::Duration::from_secs(every), threads));
+        thread::spawn(move || gateway::compactor(store, reads, schedule));
     }
     Arc::new(gateway::Gateway { store, bucket: args.bucket.clone(), client_keys, reads, workers: threads }).serve(&args.listen)
 }

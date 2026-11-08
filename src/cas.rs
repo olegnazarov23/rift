@@ -7,7 +7,7 @@
 //!   .rift/m/<key>              manifest of a compacted blob; the original key keeps an empty stub
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Condvar, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -24,7 +24,7 @@ use zstd::stream::raw::CParameter;
 
 use crate::{
     s3::Backend,
-    sigv4::{hex, sha256_hex},
+    sigv4::{hex, sha256_hex, unix_now},
     store::gzip_payload_offset,
 };
 
@@ -85,6 +85,21 @@ impl Manifest {
             })
             .collect();
         self.refs = refs;
+    }
+
+    /// The same blob with its chunks somewhere else.
+    fn with_refs(&self, refs: Vec<Ref>) -> Self {
+        Self::new(
+            self.key.clone(),
+            self.size,
+            self.sha256.clone(),
+            self.mtime,
+            self.head.clone(),
+            self.end.clone(),
+            self.groups.clone(),
+            refs,
+            self.recipe.clone(),
+        )
     }
 
     pub fn etag(&self) -> String {
@@ -217,42 +232,50 @@ pub fn analyze(key: &str, digest: &str, mtime: u64, data: &[u8], threads: usize)
     Ok(Some((m, plain)))
 }
 
+/// hash, offset, length of a chunk inside its pack
+type Entry = ([u8; 32], u32, u32);
+
 /// Puts unique chunks into packs. A full pack is handed to `store(id, zstd bytes, index bytes)`.
 pub struct Packer {
     index: HashMap<[u8; 32], Ref>,
+    /// chunks and stored size of every pack
+    packs: HashMap<u32, (Vec<Entry>, u64)>,
     id: u32,
     data: Vec<u8>,
-    entries: Vec<([u8; 32], u32, u32)>,
+    entries: Vec<Entry>,
     level: i32,
 }
 
 pub type PackSink<'a> = dyn FnMut(u32, Vec<u8>, Vec<u8>) -> Result<()> + 'a;
 
 impl Packer {
-    pub fn new(index: HashMap<[u8; 32], Ref>, next_id: u32, level: i32) -> Self {
-        Self { index, id: next_id, data: Vec::with_capacity(PACK_BYTES), entries: Vec::new(), level }
+    pub fn new(packs: HashMap<u32, (Vec<Entry>, u64)>, index: HashMap<[u8; 32], Ref>, next_id: u32, level: i32) -> Self {
+        Self { index, packs, id: next_id, data: Vec::with_capacity(PACK_BYTES), entries: Vec::new(), level }
     }
 
     /// Cuts `plain` into chunks and returns their refs; new chunks go into the open pack.
     pub fn add(&mut self, plain: &[u8], store: &mut PackSink) -> Result<Vec<Ref>> {
-        let mut refs = Vec::new();
-        for c in FastCDC::new(plain, 16 << 10, 64 << 10, 256 << 10) {
-            let bytes = &plain[c.offset..c.offset + c.length];
-            let hash = *blake3::hash(bytes).as_bytes();
-            if let Some(r) = self.index.get(&hash) {
-                refs.push(*r);
-                continue;
-            }
-            if self.data.len() + bytes.len() > PACK_BYTES {
-                self.seal(store)?;
-            }
-            let r = [self.id, self.data.len() as u32, bytes.len() as u32];
-            self.data.extend_from_slice(bytes);
-            self.entries.push((hash, r[1], r[2]));
-            self.index.insert(hash, r);
-            refs.push(r);
+        FastCDC::new(plain, 16 << 10, 64 << 10, 256 << 10)
+            .map(|c| {
+                let bytes = &plain[c.offset..c.offset + c.length];
+                self.add_chunk(*blake3::hash(bytes).as_bytes(), bytes, store)
+            })
+            .collect()
+    }
+
+    /// Where an identical chunk is already stored, or where this one goes in the open pack.
+    pub fn add_chunk(&mut self, hash: [u8; 32], bytes: &[u8], store: &mut PackSink) -> Result<Ref> {
+        if let Some(r) = self.index.get(&hash) {
+            return Ok(*r);
         }
-        Ok(refs)
+        if self.data.len() + bytes.len() > PACK_BYTES {
+            self.seal(store)?;
+        }
+        let r = [self.id, self.data.len() as u32, bytes.len() as u32];
+        self.data.extend_from_slice(bytes);
+        self.entries.push((hash, r[1], r[2]));
+        self.index.insert(hash, r);
+        Ok(r)
     }
 
     /// Stores the open pack, if it holds anything. On failure its chunks are forgotten, so nothing
@@ -271,18 +294,42 @@ impl Packer {
                 idx.extend(at.to_le_bytes());
                 idx.extend(len.to_le_bytes());
             }
-            store(self.id, z.compress(&self.data)?, idx)
+            let z = z.compress(&self.data)?;
+            let size = z.len() as u64;
+            store(self.id, z, idx).map(|_| size)
         })();
-        if stored.is_err() {
-            for (h, ..) in &self.entries {
-                self.index.remove(h);
-            }
-        } else {
-            self.id += 1;
-        }
+        let entries = std::mem::take(&mut self.entries);
         self.data.clear();
-        self.entries.clear();
-        stored
+        match stored {
+            Ok(size) => {
+                self.packs.insert(self.id, (entries, size));
+                self.id += 1;
+                Ok(())
+            }
+            Err(e) => {
+                for (h, ..) in &entries {
+                    self.index.remove(h);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Drops packs that are about to be deleted, so nothing new refers to their chunks. Returns
+    /// their stored sizes.
+    fn drop_packs(&mut self, ids: &HashSet<u32>) -> Vec<(u32, u64)> {
+        let mut sizes = Vec::new();
+        for &id in ids {
+            if let Some((entries, size)) = self.packs.remove(&id) {
+                for (h, ..) in &entries {
+                    if self.index.get(h).is_some_and(|r| r[0] == id) {
+                        self.index.remove(h);
+                    }
+                }
+                sizes.push((id, size));
+            }
+        }
+        sizes
     }
 }
 
@@ -456,10 +503,29 @@ pub struct Store {
     cache: PackCache,
     compacted: RwLock<HashMap<String, Arc<Manifest>>>,
     packer: Mutex<Packer>,
+    /// held while a manifest is added, replaced or removed
+    mutations: Mutex<()>,
+    /// packs nothing refers to any more: (id, when, stored size); deleted after a grace period
+    retired: Mutex<Vec<(u32, u64, u64)>>,
+    /// blobs forgotten since the last GC
+    forgotten: AtomicUsize,
+}
+
+#[derive(Default)]
+pub struct GcReport {
+    pub deleted: usize,
+    pub deleted_bytes: u64,
+    pub retired: usize,
+    pub rewritten: usize,
+    pub moved: usize,
 }
 
 fn pack_key(id: u32) -> String {
     format!("{PACKS}{id:08}.zst")
+}
+
+fn idx_key(id: u32) -> String {
+    format!("{PACKS}{id:08}.idx")
 }
 
 fn manifest_key(key: &str) -> String {
@@ -469,17 +535,41 @@ fn manifest_key(key: &str) -> String {
 impl Store {
     /// Loads the chunk index and the manifests already in the bucket.
     pub fn open(backend: Arc<Backend>, level: i32, cache_packs: usize) -> Result<Self> {
-        let (mut index, mut next) = (HashMap::new(), 0u32);
-        for o in backend.list(PACKS)? {
-            let Some((id, ext)) = o.key.strip_prefix(PACKS).and_then(|n| n.split_once('.')) else { continue };
-            let Ok(id) = id.parse::<u32>() else { continue };
-            next = next.max(id + 1);
-            if ext == "idx" {
-                for e in backend.get(&o.key)?.0.chunks_exact(40) {
-                    let v = |i: usize| u32::from_le_bytes(e[i..i + 4].try_into().expect("4 bytes"));
-                    index.insert(e[..32].try_into().expect("32 bytes"), [id, v(32), v(36)]);
+        let listing = backend.list(PACKS)?;
+        let name = |key: &str| -> Option<(u32, String)> {
+            let (id, ext) = key.strip_prefix(PACKS)?.split_once('.')?;
+            Some((id.parse().ok()?, ext.to_string()))
+        };
+        let (mut packs, mut index, mut next) = (HashMap::<u32, (Vec<Entry>, u64)>::new(), HashMap::new(), 0u32);
+        for o in &listing {
+            if let Some((id, ext)) = name(&o.key) {
+                next = next.max(id + 1);
+                if ext == "zst" {
+                    packs.entry(id).or_default().1 = o.size;
                 }
             }
+        }
+        for o in &listing {
+            let Some((id, ext)) = name(&o.key) else { continue };
+            if ext != "idx" {
+                continue;
+            }
+            let entries: Vec<Entry> = backend
+                .get(&o.key)?
+                .0
+                .chunks_exact(40)
+                .map(|e| {
+                    let v = |i: usize| u32::from_le_bytes(e[i..i + 4].try_into().expect("4 bytes"));
+                    (e[..32].try_into().expect("32 bytes"), v(32), v(36))
+                })
+                .collect();
+            // an index whose pack is missing is left for GC, never used for dedup
+            if packs.contains_key(&id) {
+                for e in &entries {
+                    index.insert(e.0, [id, e.1, e.2]);
+                }
+            }
+            packs.entry(id).or_default().0 = entries;
         }
         let mut compacted = HashMap::new();
         for o in backend.list(MANIFESTS)? {
@@ -490,7 +580,10 @@ impl Store {
             backend,
             cache: PackCache::new(cache_packs),
             compacted: RwLock::new(compacted),
-            packer: Mutex::new(Packer::new(index, next, level)),
+            packer: Mutex::new(Packer::new(packs, index, next, level)),
+            mutations: Mutex::new(()),
+            retired: Mutex::new(Vec::new()),
+            forgotten: AtomicUsize::new(0),
         })
     }
 
@@ -502,13 +595,126 @@ impl Store {
         self.compacted.read().unwrap().get(key).cloned()
     }
 
-    /// The key was deleted or overwritten: its manifest goes (its chunks stay until a chunk GC).
+    /// The key was deleted or overwritten: its manifest goes; GC reclaims its chunks.
     pub fn forget(&self, key: &str) {
-        if self.compacted.write().unwrap().remove(key).is_some()
-            && let Err(e) = self.backend.delete(&manifest_key(key))
-        {
-            eprintln!("rift: could not delete the manifest of {key}: {e:#}");
+        let _m = self.mutations.lock().unwrap();
+        if self.compacted.write().unwrap().remove(key).is_some() {
+            self.forgotten.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = self.backend.delete(&manifest_key(key)) {
+                eprintln!("rift: could not delete the manifest of {key}: {e:#}");
+            }
         }
+    }
+
+    /// Points a still-compacted blob at moved chunks.
+    fn replace_manifest(&self, m: Manifest) -> Result<()> {
+        let _m = self.mutations.lock().unwrap();
+        if !self.compacted.read().unwrap().contains_key(&m.key) {
+            return Ok(()); // deleted meanwhile
+        }
+        self.backend.put(&manifest_key(&m.key), m.encode(), &[])?;
+        self.compacted.write().unwrap().insert(m.key.clone(), Arc::new(m));
+        Ok(())
+    }
+
+    pub fn gc_due(&self) -> bool {
+        self.forgotten.load(Ordering::Relaxed) > 0 || !self.retired.lock().unwrap().is_empty()
+    }
+
+    /// Reclaims chunks no manifest uses. A pack with nothing live is retired; a pack with less than
+    /// `rewrite_below` of its bytes live has those chunks copied to new packs and its blobs pointed
+    /// there, then is retired. Retired packs are deleted `grace` seconds later, so reads that
+    /// started before still find them. Run it between compactions, never during one.
+    pub fn gc(&self, rewrite_below: f64, grace: u64) -> Result<GcReport> {
+        let mut report = GcReport::default();
+        let now = unix_now();
+        let mut packer = self.packer.lock().unwrap();
+        {
+            let mut retired = self.retired.lock().unwrap();
+            let (due, waiting): (Vec<_>, Vec<_>) = retired.drain(..).partition(|r| r.1 + grace <= now);
+            *retired = waiting;
+            for (id, when, size) in due {
+                match self.backend.delete(&pack_key(id)).and_then(|_| self.backend.delete(&idx_key(id))) {
+                    Ok(()) => {
+                        report.deleted += 1;
+                        report.deleted_bytes += size;
+                    }
+                    Err(e) => {
+                        eprintln!("rift: gc: deleting pack {id}: {e:#}");
+                        retired.push((id, when, size));
+                    }
+                }
+            }
+        }
+        self.forgotten.store(0, Ordering::Relaxed);
+        let manifests: Vec<Arc<Manifest>> = self.compacted.read().unwrap().values().cloned().collect();
+        let mut live: HashMap<u32, HashSet<u32>> = HashMap::new();
+        for m in &manifests {
+            for r in &m.refs {
+                live.entry(r[0]).or_default().insert(r[1]);
+            }
+        }
+        let (mut dead, mut sparse) = (HashSet::new(), Vec::new());
+        for (&id, (entries, _)) in &packer.packs {
+            let total: u64 = entries.iter().map(|e| u64::from(e.2)).sum();
+            let used = live.get(&id);
+            let live_bytes: u64 =
+                entries.iter().filter(|e| used.is_some_and(|u| u.contains(&e.1))).map(|e| u64::from(e.2)).sum();
+            if live_bytes == 0 {
+                dead.insert(id);
+            } else if (live_bytes as f64) < rewrite_below * total as f64 {
+                sparse.push((id, entries.clone()));
+            }
+        }
+        // copy the live chunks of sparse packs; dedup mustn't find the old copies meanwhile
+        let mut moved: HashMap<(u32, u32), Ref> = HashMap::new();
+        for (id, entries) in &sparse {
+            for (h, ..) in entries {
+                if packer.index.get(h).is_some_and(|r| r[0] == *id) {
+                    packer.index.remove(h);
+                }
+            }
+        }
+        let copied = (|| -> Result<()> {
+            for (id, entries) in &sparse {
+                let data = self.fetch_pack(*id)?;
+                let used = &live[id];
+                for &(h, at, len) in entries.iter().filter(|e| used.contains(&e.1)) {
+                    let bytes = data.get(at as usize..(at + len) as usize).context("chunk outside its pack")?;
+                    let r = packer.add_chunk(h, bytes, &mut |i, z, x| self.store_pack(i, z, x))?;
+                    moved.insert((*id, at), r);
+                }
+            }
+            packer.seal(&mut |i, z, x| self.store_pack(i, z, x))
+        })();
+        if let Err(e) = copied {
+            // dedup finds the originals again; partial copies are unreferenced and go next time
+            for (id, entries) in &sparse {
+                for &(h, at, len) in entries {
+                    packer.index.insert(h, [*id, at, len]);
+                }
+            }
+            return Err(e.context("copying live chunks out of sparse packs"));
+        }
+        let sparse_ids: HashSet<u32> = sparse.iter().map(|(id, _)| *id).collect();
+        let mut stuck = HashSet::new();
+        for m in &manifests {
+            if !m.refs.iter().any(|r| sparse_ids.contains(&r[0])) {
+                continue;
+            }
+            let refs = m.refs.iter().map(|r| moved.get(&(r[0], r[1])).copied().unwrap_or(*r)).collect();
+            if let Err(e) = self.replace_manifest(m.with_refs(refs)) {
+                eprintln!("rift: gc: pointing {} at its moved chunks: {e:#}", m.key);
+                stuck.extend(m.refs.iter().map(|r| r[0]).filter(|id| sparse_ids.contains(id)));
+            }
+        }
+        let retire: HashSet<u32> = dead.iter().chain(sparse_ids.difference(&stuck)).copied().collect();
+        let sizes = packer.drop_packs(&retire);
+        self.retired.lock().unwrap().extend(sizes.into_iter().map(|(id, size)| (id, now, size)));
+        report.retired = dead.len();
+        report.rewritten = sparse_ids.len() - stuck.len();
+        report.moved = moved.len();
+        Ok(report)
     }
 
     fn fetch_pack(&self, id: u32) -> Result<Vec<u8>> {
@@ -522,7 +728,7 @@ impl Store {
 
     fn store_pack(&self, id: u32, pack: Vec<u8>, idx: Vec<u8>) -> Result<()> {
         self.backend.put(&pack_key(id), pack, &[])?;
-        self.backend.put(&format!("{PACKS}{id:08}.idx"), idx, &[])?;
+        self.backend.put(&idx_key(id), idx, &[])?;
         Ok(())
     }
 
@@ -583,7 +789,10 @@ impl Store {
             return Ok(false);
         }
         let size = m.size;
-        self.compacted.write().unwrap().insert(key.clone(), Arc::new(m));
+        {
+            let _m = self.mutations.lock().unwrap();
+            self.compacted.write().unwrap().insert(key.clone(), Arc::new(m));
+        }
         // the stub keeps the key in listings; If-Match so a blob deleted meanwhile isn't brought back
         let stub = self.backend.put(
             &key,
@@ -635,7 +844,7 @@ mod tests {
         let (mut m, plain) = analyze("k", &digest, 0, &blob, 4).unwrap().expect("rebuildable");
         assert!(m.groups.len() > 1, "test needs several groups");
         let packs: Mutex<HashMap<u32, Arc<Vec<u8>>>> = Mutex::new(HashMap::new());
-        let mut packer = Packer::new(HashMap::new(), 0, 3);
+        let mut packer = Packer::new(HashMap::new(), HashMap::new(), 0, 3);
         let mut sink = |id: u32, z: Vec<u8>, _idx: Vec<u8>| {
             packs.lock().unwrap().insert(id, Arc::new(zstd::bulk::decompress(&z, 64 << 20)?));
             Ok(())

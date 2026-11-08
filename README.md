@@ -68,15 +68,21 @@ sign with the client keys, and set `redirect: disable: true`.
   empty stub.
 - A read of a compacted blob streams the rebuild, byte ranges included. Listings show the original
   size and date. Deleting a blob drops its manifest.
+- Chunk GC runs after deletes. Packs nothing uses are retired; packs under half used
+  (`--gc-rewrite-below`) have their live chunks copied out first. Retired packs stay readable for
+  `--gc-grace` (default 10m), so reads already streaming finish, then they're deleted.
 
-Not done yet: garbage collection of chunks (packs keep the chunks of deleted blobs), keeping a hot
-copy after a cold read, presigned-URL redirects, and more than one gateway per bucket.
+Not done yet: keeping a hot copy after a cold read, presigned-URL redirects, and more than one
+gateway per bucket.
 
 Tested locally against distribution 2.8.3 and MinIO with 3 redis and 3 postgres images (69 blobs,
 577.7 MB). The bucket held 238.6 MB, 58.7% less. Every blob read back through the registry was
 byte-exact, `docker pull` from scratch worked and the image ran, and registry garbage collection
 deleted compacted blobs cleanly. The same under Harbor v2.14.6 (its `storage_service.s3` pointed at
 rift): 3 images, 249.1 MB stored in 138.2 MB, every blob byte-exact, `docker pull` from scratch fine.
+Deleting 3 of the 6 images and running both garbage collectors took the first bucket from 237.7 MB
+to 146.9 MB for the remaining 249.1 MB, close to the 138.2 MB of a fresh store of the same images;
+every remaining blob stayed byte-exact.
 
 ## Build
 
