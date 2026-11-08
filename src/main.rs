@@ -1,6 +1,10 @@
 //! rift: byte-exact recompression for container registries and object storage.
 
+mod cas;
+mod gateway;
 mod registry;
+mod s3;
+mod sigv4;
 mod store;
 
 use std::{
@@ -8,7 +12,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Condvar, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -16,7 +20,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 
@@ -37,6 +41,84 @@ struct Cli {
 enum Cmd {
     /// Measure how much smaller your data would be, byte-exact, without changing anything
     Scan(ScanArgs),
+    /// Serve S3 in front of a bucket, compacting blobs that go cold
+    Gateway(GatewayArgs),
+}
+
+#[derive(Args)]
+struct GatewayArgs {
+    /// Address to listen on
+    #[arg(long, default_value = "127.0.0.1:9100")]
+    listen: String,
+    /// The backing S3 endpoint, e.g. https://s3.us-east-1.amazonaws.com
+    #[arg(long)]
+    backend: String,
+    /// Bucket name clients use; also the backing bucket unless --backend-bucket
+    #[arg(long)]
+    bucket: String,
+    #[arg(long)]
+    backend_bucket: Option<String>,
+    #[arg(long, default_value = "us-east-1")]
+    region: String,
+    /// Compact blobs nobody has written or read for this long (30s, 10m, 12h, 7d)
+    #[arg(long, default_value = "7d")]
+    cold_after: String,
+    /// How often to look for cold blobs
+    #[arg(long, default_value = "1m")]
+    interval: String,
+    /// Smallest blob worth compacting, in MB
+    #[arg(long, default_value_t = 1.0)]
+    min_size_mb: f64,
+    /// zstd level for packs
+    #[arg(long, default_value_t = 19)]
+    pack_level: i32,
+    /// Threads for compaction and for each rebuild (default: all cores)
+    #[arg(long)]
+    threads: Option<usize>,
+}
+
+/// "30s", "10m", "12h", "7d" or plain seconds.
+fn seconds(s: &str) -> Result<u64> {
+    let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: u64 = n.parse().with_context(|| format!("bad duration {s}"))?;
+    Ok(n * match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => bail!("bad duration unit in {s}"),
+    })
+}
+
+fn gateway(args: &GatewayArgs) -> Result<()> {
+    let env = |k: &str| std::env::var(k).with_context(|| format!("set {k}"));
+    let bucket = args.backend_bucket.as_deref().unwrap_or(&args.bucket);
+    let backend = s3::Backend::new(&args.backend, bucket, &args.region, env("RIFT_BACKEND_ACCESS_KEY")?, env("RIFT_BACKEND_SECRET_KEY")?)?;
+    let client_keys = match (std::env::var("RIFT_CLIENT_ACCESS_KEY"), std::env::var("RIFT_CLIENT_SECRET_KEY")) {
+        (Ok(a), Ok(s)) => Some((a, s)),
+        _ => None,
+    };
+    let loopback = args.listen.starts_with("127.") || args.listen.starts_with("localhost:") || args.listen.starts_with("[::1]");
+    if client_keys.is_none() && !loopback {
+        bail!("set RIFT_CLIENT_ACCESS_KEY and RIFT_CLIENT_SECRET_KEY to listen beyond localhost");
+    }
+    let threads = args.threads.unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
+    let store = Arc::new(cas::Store::open(Arc::new(backend), args.pack_level, 64)?);
+    eprintln!(
+        "rift gateway on {} for {}/{bucket}: {} compacted blobs, compacting after {} cold, client signatures {}",
+        args.listen,
+        args.backend,
+        store.len(),
+        args.cold_after,
+        if client_keys.is_some() { "checked" } else { "not checked" }
+    );
+    let reads = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (cold, every, min) = (seconds(&args.cold_after)?, seconds(&args.interval)?, (args.min_size_mb * 1e6) as u64);
+    {
+        let (store, reads) = (store.clone(), reads.clone());
+        thread::spawn(move || gateway::compactor(store, reads, cold, min, std::time::Duration::from_secs(every), threads));
+    }
+    Arc::new(gateway::Gateway { store, bucket: args.bucket.clone(), client_keys, reads, workers: threads }).serve(&args.listen)
 }
 
 #[derive(Args)]
@@ -408,5 +490,6 @@ fn scan(args: &ScanArgs) -> Result<()> {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Scan(args) => scan(&args),
+        Cmd::Gateway(args) => gateway(&args),
     }
 }
