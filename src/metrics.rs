@@ -86,7 +86,7 @@ pub fn render() -> String {
     put("compaction_failures_total", "counter", "Blobs that were left as they were (not rebuildable byte-exact, or errors).", g(&m.compaction_failures));
     put("cold_reads_total", "counter", "Reads served by rebuilding a compacted blob.", g(&m.cold_reads));
     put("cold_read_bytes_total", "counter", "Bytes served by rebuilding.", g(&m.cold_read_bytes));
-    put("cold_read_seconds_total", "counter", "Time spent streaming rebuilt blobs.", g(&m.cold_read_ms) / 1e3);
+    put("cold_read_seconds_total", "counter", "Time spent rebuilding blobs for reads.", g(&m.cold_read_ms) / 1e3);
     put("cold_read_errors_total", "counter", "Rebuilds that failed part way.", g(&m.cold_read_errors));
     put("hot_copies_made_total", "counter", "Originals put back after a cold read.", g(&m.hot_copies_made));
     put("hot_copies_cooled_total", "counter", "Hot copies replaced by the stub again.", g(&m.hot_copies_cooled));

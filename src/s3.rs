@@ -1,9 +1,9 @@
 //! The backing S3 bucket, plus the pieces of S3's wire format the gateway reads or rewrites.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::{Client, Response};
 
-use crate::sigv4::{amz_date, canonical_query, civil, days_from_civil, sign, unix_now, uri_encode};
+use crate::sigv4::{Seed, amz_date, canonical_query, chunk_signature, civil, days_from_civil, sign, unix_now, uri_encode};
 
 pub struct Backend {
     client: Client,
@@ -261,23 +261,48 @@ pub fn iso(unix: u64) -> String {
 }
 
 /// Strips aws-chunked framing ("<hex size>[;chunk-signature=…]\r\n<data>\r\n", ending with a
-/// zero-size chunk and optional trailers). Chunk signatures aren't checked.
-pub fn decode_aws_chunked(body: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(body.len());
-    let mut i = 0;
+/// zero-size chunk and optional trailers). With `seed` (a signed streaming upload) every chunk's
+/// signature must chain from it. Returns the data and the trailing headers, e.g. checksums;
+/// a trailer's own signature isn't checked, but checksums go on to the backend, which checks them.
+pub fn decode_aws_chunked(body: &[u8], seed: Option<&Seed>) -> Result<(Vec<u8>, Vec<(String, String)>)> {
+    let line = |at: usize| -> Result<(&str, usize)> {
+        let end = body[at..].windows(2).position(|w| w == b"\r\n").context("aws-chunked: no line end")? + at;
+        Ok((std::str::from_utf8(&body[at..end])?, end + 2))
+    };
+    let (mut out, mut i) = (Vec::with_capacity(body.len()), 0);
+    let mut previous = seed.map(|s| s.signature.clone());
     loop {
-        let line_end = body[i..].windows(2).position(|w| w == b"\r\n").context("aws-chunked: no chunk header")? + i;
-        let header = std::str::from_utf8(&body[i..line_end])?;
-        let size = usize::from_str_radix(header.split(';').next().unwrap_or("").trim(), 16)
-            .context("aws-chunked: bad chunk size")?;
-        i = line_end + 2;
-        if size == 0 {
-            return Ok(out);
+        let (header, next) = line(i)?;
+        let (size, signature) = header.split_once(";chunk-signature=").map_or((header, None), |(n, s)| (n, Some(s)));
+        let size = usize::from_str_radix(size.trim(), 16).context("aws-chunked: bad chunk size")?;
+        let data = body.get(next..next + size).context("aws-chunked: chunk runs past the body")?;
+        if let (Some(seed), Some(prev)) = (seed, previous.as_mut()) {
+            let expected = chunk_signature(seed, prev, data);
+            ensure!(signature == Some(expected.as_str()), "aws-chunked: chunk signature doesn't match");
+            *prev = expected;
         }
-        let data = body.get(i..i + size).context("aws-chunked: chunk runs past the body")?;
         out.extend_from_slice(data);
-        i += size + 2;
+        if size == 0 {
+            i = next;
+            break;
+        }
+        i = next + size + 2;
     }
+    let mut trailers = Vec::new();
+    while i < body.len() {
+        let (l, next) = line(i)?;
+        i = next;
+        if l.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = l.split_once(':') {
+            let k = k.trim().to_ascii_lowercase();
+            if k != "x-amz-trailer-signature" {
+                trailers.push((k, v.trim().to_string()));
+            }
+        }
+    }
+    Ok((out, trailers))
 }
 
 #[cfg(test)]
@@ -287,8 +312,30 @@ mod tests {
     #[test]
     fn chunked() {
         let body = b"5;chunk-signature=ab\r\nhello\r\n6;chunk-signature=cd\r\n world\r\n0;chunk-signature=ef\r\n\r\n";
-        assert_eq!(decode_aws_chunked(body).unwrap(), b"hello world");
-        assert_eq!(decode_aws_chunked(b"3\r\nabc\r\n0\r\nx-amz-checksum-crc32:AAAA\r\n\r\n").unwrap(), b"abc");
+        assert_eq!(decode_aws_chunked(body, None).unwrap().0, b"hello world");
+        let (data, trailers) = decode_aws_chunked(b"3\r\nabc\r\n0\r\nx-amz-checksum-crc32:AAAA\r\n\r\n", None).unwrap();
+        assert_eq!((data.as_slice(), trailers), (&b"abc"[..], vec![("x-amz-checksum-crc32".to_string(), "AAAA".to_string())]));
+    }
+
+    // the S3 documentation's chunked-upload example, with signatures checked
+    #[test]
+    fn chunked_signatures() {
+        let seed = Seed {
+            signature: "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9".into(),
+            amz_date: "20130524T000000Z".into(),
+            scope: "20130524/us-east-1/s3/aws4_request".into(),
+            key: crate::sigv4::signing_key("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "20130524", "us-east-1"),
+        };
+        let mut body = b"10000;chunk-signature=ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648\r\n".to_vec();
+        body.extend([b'a'; 65536]);
+        body.extend(b"\r\n400;chunk-signature=0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497\r\n");
+        body.extend([b'a'; 1024]);
+        body.extend(b"\r\n0;chunk-signature=b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9\r\n\r\n");
+        assert_eq!(body.len(), 66824);
+        assert_eq!(decode_aws_chunked(&body, Some(&seed)).unwrap().0, vec![b'a'; 66560]);
+        let mut tampered = body.clone();
+        tampered[200] = b'b';
+        assert!(decode_aws_chunked(&tampered, Some(&seed)).is_err(), "a changed byte breaks the chain");
     }
 
     #[test]

@@ -45,7 +45,23 @@ resources:
   limits:
     memory: 8Gi
 
-# Hot copies are written here while a cold blob streams: size it for your largest layers.
+# Past these, clients get 413 or 503 SlowDown (registries and S3 clients retry 503s).
+limits:
+  # largest request body; registries upload blobs in parts far smaller
+  maxBodyMB: 1024
+  maxRequests: 512
+  # rebuilds at once (each on `threads` cores); more wait up to a minute
+  maxColdReads: 4
+  # temp disk for rebuilt blobs waiting on slow clients: keep it under tmp.sizeLimit
+  maxSpillGB: 16
+
+# Serve HTTPS from a kubernetes.io/tls Secret (kubectl create secret tls rift-tls --cert=… --key=…);
+# then the registry uses https://<service>:9100 with secure: true.
+tls:
+  secretName: ""
+
+# Cold reads are rebuilt into files here while clients download them, and hot copies are made from
+# them: size it for your largest layers times concurrent cold pulls, above limits.maxSpillGB.
 tmp:
   sizeLimit: 20Gi
 

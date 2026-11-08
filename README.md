@@ -78,6 +78,10 @@ sign with the client keys, and set `redirect: disable: true`.
   through rift.
 - `GET /-/metrics` (Prometheus: stored vs logical bytes, compaction, cold reads, GC) and
   `GET /-/healthz`; `rift eject` puts every original back and removes rift's data.
+- Every request must be signed with the client keys within 15 minutes of rift's clock; bodies are
+  checked against their signed hash, chunk signatures and checksums. `--tls-cert`/`--tls-key` serve
+  HTTPS. `--max-body-mb`, `--max-requests`, `--max-cold-reads` and `--max-spill-gb` bound what one
+  client can take (details in [docs/PILOT.md](docs/PILOT.md#5-security)).
 
 Running it for a pilot (Docker, Helm, registry settings, leaving): [docs/PILOT.md](docs/PILOT.md).
 Not done yet: more than one gateway per bucket.

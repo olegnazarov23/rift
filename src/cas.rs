@@ -1195,6 +1195,32 @@ mod tests {
         }
     }
 
+    // Manifests come from the bucket: corrupt ones must fail cleanly, never panic.
+    #[test]
+    fn manifest_decode_survives_corruption() {
+        let m = Manifest::new("k".into(), 10, "0".repeat(64), 1, vec![1, 2], vec![3], vec![(2, None), (5, Some(7))], vec![[0, 0, 4], [1, 4, 6]], vec![9; 40]);
+        let good = m.encode();
+        assert!(Manifest::decode(&good).is_ok());
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut b = good.clone();
+            match x % 3 {
+                0 => b.truncate((x >> 8) as usize % (good.len() + 1)),
+                1 => {
+                    let i = (x >> 8) as usize % b.len();
+                    b[i] = (x >> 24) as u8;
+                }
+                _ => b = (0..(x >> 8) % 200).map(|i| (x >> (i % 56)) as u8).collect(),
+            }
+            let _ = Manifest::decode(&b);
+            let _ = parse_manifest_key(&String::from_utf8_lossy(&b));
+            let _ = blob_digest(&String::from_utf8_lossy(&b));
+        }
+    }
+
     #[test]
     fn manifest_names() {
         let info = BlobInfo { size: 1234, mtime: 99 };

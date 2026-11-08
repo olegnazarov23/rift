@@ -45,6 +45,14 @@ spec:
             - --gc-grace={{ .Values.gc.grace }}
             - --gc-rewrite-below={{ .Values.gc.rewriteBelow }}
             - --state-dir=/var/lib/rift
+            - --max-body-mb={{ .Values.limits.maxBodyMB }}
+            - --max-requests={{ .Values.limits.maxRequests }}
+            - --max-cold-reads={{ .Values.limits.maxColdReads }}
+            - --max-spill-gb={{ .Values.limits.maxSpillGB }}
+            {{- if .Values.tls.secretName }}
+            - --tls-cert=/etc/rift/tls/tls.crt
+            - --tls-key=/etc/rift/tls/tls.key
+            {{- end }}
             {{- with .Values.backend.redirectEndpoint }}
             - --redirect-endpoint={{ . }}
             {{- end }}
@@ -64,10 +72,12 @@ spec:
             httpGet:
               path: /-/healthz
               port: s3
+              scheme: {{ if .Values.tls.secretName }}HTTPS{{ else }}HTTP{{ end }}
           livenessProbe:
             httpGet:
               path: /-/healthz
               port: s3
+              scheme: {{ if .Values.tls.secretName }}HTTPS{{ else }}HTTP{{ end }}
             periodSeconds: 20
             failureThreshold: 6
           resources:
@@ -82,7 +92,17 @@ spec:
               mountPath: /tmp
             - name: state
               mountPath: /var/lib/rift
+            {{- if .Values.tls.secretName }}
+            - name: tls
+              mountPath: /etc/rift/tls
+              readOnly: true
+            {{- end }}
       volumes:
+        {{- if .Values.tls.secretName }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        {{- end }}
         - name: tmp
           emptyDir:
             sizeLimit: {{ .Values.tmp.sizeLimit }}

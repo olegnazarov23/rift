@@ -1,6 +1,6 @@
 rift is serving S3 for bucket {{ .Values.backend.bucket }} at:
 
-  http://{{ include "rift.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+  {{ if .Values.tls.secretName }}https{{ else }}http{{ end }}://{{ include "rift.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
 
 Point your registry's S3 storage at that endpoint (path-style), using the client keys, and keep
 the bucket name. Nothing in the bucket changes until blobs have been cold for {{ .Values.compaction.coldAfter }}.

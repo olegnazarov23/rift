@@ -135,6 +135,24 @@ struct GatewayArgs {
     /// Where the chunk index lives (rebuilt from the bucket if lost); default: a temp directory
     #[arg(long)]
     state_dir: Option<std::path::PathBuf>,
+    /// Serve HTTPS with this certificate (PEM, with any intermediates)
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<std::path::PathBuf>,
+    /// The certificate's private key (PEM)
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<std::path::PathBuf>,
+    /// Largest request body accepted, in MB (registries upload blobs in parts far smaller)
+    #[arg(long, default_value_t = 1024)]
+    max_body_mb: usize,
+    /// Requests in flight before new ones get 503 SlowDown
+    #[arg(long, default_value_t = 512)]
+    max_requests: usize,
+    /// Cold rebuilds at once (each on --threads cores); more wait up to a minute, then get 503 SlowDown
+    #[arg(long, default_value_t = 4)]
+    max_cold_reads: u64,
+    /// Temp disk for rebuilt blobs waiting on slow clients, in GB; keep it under the temp dir's size
+    #[arg(long, default_value_t = 16)]
+    max_spill_gb: u64,
 }
 
 fn state_dir(given: &Option<std::path::PathBuf>, bucket: &str) -> std::path::PathBuf {
@@ -170,7 +188,8 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
     let dir = state_dir(&args.state_dir, bucket);
     let store = Arc::new(cas::Store::open(Arc::new(backend), &dir, args.pack_level, 64, threads, args.manifest_cache_mb << 20)?);
     eprintln!(
-        "rift gateway on {} for {}/{bucket}: {} compacted blobs, compacting after {} cold, client signatures {}",
+        "rift gateway on {}{} for {}/{bucket}: {} compacted blobs, compacting after {} cold, client signatures {}",
+        if args.tls_cert.is_some() { "https://" } else { "" },
         args.listen,
         args.backend,
         store.len(),
@@ -191,6 +210,13 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
         let (store, reads) = (store.clone(), reads.clone());
         thread::spawn(move || gateway::compactor(store, reads, schedule));
     }
+    let tls = match (&args.tls_cert, &args.tls_key) {
+        (Some(c), Some(k)) => Some((
+            std::fs::read(c).with_context(|| format!("reading {}", c.display()))?,
+            std::fs::read(k).with_context(|| format!("reading {}", k.display()))?,
+        )),
+        _ => None,
+    };
     Arc::new(gateway::Gateway {
         store,
         bucket: args.bucket.clone(),
@@ -199,8 +225,12 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
         workers: threads,
         redirect: args.redirect_endpoint.clone(),
         hot_copy: !args.no_hot_copy,
+        max_body: args.max_body_mb << 20,
+        max_requests: args.max_requests,
+        cold_reads: Arc::new(gateway::Slots::new(args.max_cold_reads)),
+        spill: Arc::new(gateway::Slots::new(args.max_spill_gb << 30)),
     })
-    .serve(&args.listen)
+    .serve(&args.listen, tls)
 }
 
 #[derive(Args)]

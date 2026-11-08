@@ -132,14 +132,50 @@ pub fn sign(
     let date = &amz_date[..8];
     let scope = format!("{date}/{region}/s3/aws4_request");
     let to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(request.as_bytes()));
-    let key = [date, region, "s3", "aws4_request"]
-        .iter()
-        .fold(format!("AWS4{secret}").into_bytes(), |k, part| hmac(&k, part.as_bytes()));
-    (hex(&hmac(&key, to_sign.as_bytes())), signed)
+    (hex(&hmac(&signing_key(secret, date, region), to_sign.as_bytes())), signed)
 }
 
-/// Checks a client's `Authorization` header against our credentials. `header` looks up request
-/// headers by lowercase name; `path` and `raw_query` are as the client sent them.
+/// The key a day's requests in a region are signed with.
+pub fn signing_key(secret: &str, date: &str, region: &str) -> Vec<u8> {
+    [date, region, "s3", "aws4_request"].iter().fold(format!("AWS4{secret}").into_bytes(), |k, part| hmac(&k, part.as_bytes()))
+}
+
+/// What a verified request's streamed chunks are signed against.
+pub struct Seed {
+    pub signature: String,
+    pub amz_date: String,
+    pub scope: String,
+    pub key: Vec<u8>,
+}
+
+/// The signature of one aws-chunked chunk, chained from the previous one (the seed's first).
+pub fn chunk_signature(seed: &Seed, previous: &str, chunk: &[u8]) -> String {
+    const EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let to_sign = format!(
+        "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{previous}\n{EMPTY}\n{}",
+        seed.amz_date,
+        seed.scope,
+        sha256_hex(chunk)
+    );
+    hex(&hmac(&seed.key, to_sign.as_bytes()))
+}
+
+/// How far a signed request's clock may be from ours, as S3 allows.
+pub const MAX_SKEW: u64 = 15 * 60;
+
+/// Why a signed request was refused.
+#[derive(Debug, PartialEq)]
+pub enum Denied {
+    /// other credentials, a malformed header, or a request changed after signing
+    Signature,
+    /// signed over 15 minutes from our clock: a replay, or the client's clock is off (S3 says
+    /// RequestTimeTooSkewed, which SDKs answer by correcting their clock and retrying)
+    Skewed,
+}
+
+/// Checks a client's `Authorization` header against our credentials, and that it was signed within
+/// the last 15 minutes. `header` looks up request headers by lowercase name; `path` and `raw_query`
+/// are as the client sent them. Returns what streamed chunks are then signed against.
 pub fn verify(
     access_key: &str,
     secret: &str,
@@ -148,8 +184,8 @@ pub fn verify(
     raw_query: &str,
     authorization: &str,
     header: &dyn Fn(&str) -> Option<String>,
-) -> bool {
-    let Some(fields) = authorization.strip_prefix("AWS4-HMAC-SHA256") else { return false };
+) -> Result<Seed, Denied> {
+    let fields = authorization.strip_prefix("AWS4-HMAC-SHA256").ok_or(Denied::Signature)?;
     let (mut credential, mut signed, mut signature) = ("", "", "");
     for f in fields.split(',') {
         let f = f.trim();
@@ -162,9 +198,12 @@ pub fn verify(
         }
     }
     let scope: Vec<&str> = credential.split('/').collect();
-    let Some(date) = header("x-amz-date") else { return false };
+    let date = header("x-amz-date").ok_or(Denied::Signature)?;
     if scope.len() != 5 || scope[0] != access_key || !date.starts_with(scope[1]) {
-        return false;
+        return Err(Denied::Signature);
+    }
+    if parse_amz_date(&date).ok_or(Denied::Signature)?.abs_diff(unix_now()) > MAX_SKEW {
+        return Err(Denied::Skewed);
     }
     let values: Vec<(String, String)> =
         signed.split(';').map(|h| (h.to_string(), header(h).unwrap_or_default())).collect();
@@ -172,8 +211,12 @@ pub fn verify(
     let payload = header("x-amz-content-sha256").unwrap_or_else(|| "UNSIGNED-PAYLOAD".into());
     let query = canonical_query(&parse_query(raw_query));
     let (expected, _) = sign(secret, scope[2], &date, method, path, &query, &headers, &payload);
-    expected.len() == signature.len()
-        && expected.bytes().zip(signature.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    let equal = expected.len() == signature.len()
+        && expected.bytes().zip(signature.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+    if !equal {
+        return Err(Denied::Signature);
+    }
+    Ok(Seed { signature: expected, scope: scope[1..].join("/"), key: signing_key(secret, scope[1], scope[2]), amz_date: date })
 }
 
 /// "20261107T120000Z" to unix seconds.
@@ -248,6 +291,68 @@ mod tests {
         );
         assert_eq!(signed, "host;range;x-amz-content-sha256;x-amz-date");
         assert_eq!(sig, "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41");
+    }
+
+    // "Example: PUT Object" from the S3 chunked-upload (SigV4 streaming) documentation
+    #[test]
+    fn aws_streaming_example() {
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let (seed, _) = sign(
+            secret,
+            "us-east-1",
+            "20130524T000000Z",
+            "PUT",
+            "/examplebucket/chunkObject.txt",
+            "",
+            &[
+                ("content-encoding", "aws-chunked"),
+                ("content-length", "66824"),
+                ("host", "s3.amazonaws.com"),
+                ("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+                ("x-amz-date", "20130524T000000Z"),
+                ("x-amz-decoded-content-length", "66560"),
+                ("x-amz-storage-class", "REDUCED_REDUNDANCY"),
+            ],
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        );
+        assert_eq!(seed, "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9");
+        let s = Seed {
+            signature: seed.clone(),
+            amz_date: "20130524T000000Z".into(),
+            scope: "20130524/us-east-1/s3/aws4_request".into(),
+            key: signing_key(secret, "20130524", "us-east-1"),
+        };
+        let c1 = chunk_signature(&s, &seed, &[b'a'; 65536]);
+        assert_eq!(c1, "ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648");
+        let c2 = chunk_signature(&s, &c1, &[b'a'; 1024]);
+        assert_eq!(c2, "0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497");
+        assert_eq!(chunk_signature(&s, &c2, b""), "b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9");
+    }
+
+    #[test]
+    fn verify_checks_signature_and_clock() {
+        let signed_at = |unix: u64| {
+            let date = amz_date(unix);
+            let headers: Vec<(String, String)> = [("host", "h:1"), ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("x-amz-date", date.as_str())]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let (sig, list) = sign("SK", "us-east-1", &date, "GET", "/b/k", "", &refs, "UNSIGNED-PAYLOAD");
+            let auth = format!("AWS4-HMAC-SHA256 Credential=AK/{}/us-east-1/s3/aws4_request, SignedHeaders={list}, Signature={sig}", &date[..8]);
+            let header = move |h: &str| headers.iter().find(|(k, _)| k == h).map(|(_, v)| v.clone());
+            (auth, header)
+        };
+        let (auth, header) = signed_at(unix_now());
+        assert!(verify("AK", "SK", "GET", "/b/k", "", &auth, &header).is_ok());
+        assert_eq!(verify("AK", "SK", "PUT", "/b/k", "", &auth, &header).err(), Some(Denied::Signature));
+        assert_eq!(verify("AK", "other", "GET", "/b/k", "", &auth, &header).err(), Some(Denied::Signature));
+        let (stale, header) = signed_at(unix_now() - 3600);
+        assert_eq!(verify("AK", "SK", "GET", "/b/k", "", &stale, &header).err(), Some(Denied::Skewed), "an hour-old signature is a replay");
+        let (ahead, header) = signed_at(unix_now() + 3600);
+        assert_eq!(verify("AK", "SK", "GET", "/b/k", "", &ahead, &header).err(), Some(Denied::Skewed));
+        let (recent, header) = signed_at(unix_now() - 60);
+        assert!(verify("AK", "SK", "GET", "/b/k", "", &recent, &header).is_ok(), "a minute of skew is fine");
     }
 
     #[test]

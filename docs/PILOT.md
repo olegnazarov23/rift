@@ -99,7 +99,58 @@ downloads. To keep that, turn redirects back on and start rift with
 from S3 directly; only cold ones stream through rift. Your nodes must be able to reach rift's
 endpoint as well as the registry.
 
-## 5. What happens next
+## 5. Security
+
+**What rift checks on every request**
+
+- The signature: SigV4 with the client keys, in the header or a presigned URL. Anything unsigned or
+  signed with other keys gets 403. A request signed more than 15 minutes from rift's clock gets 403
+  `RequestTimeTooSkewed` (what S3 says; AWS SDKs correct their clock and retry), so a captured
+  request can't be replayed later.
+- The body against what was signed: a signed payload hash is checked (400
+  `XAmzContentSHA256Mismatch`), every chunk of a signed `aws-chunked` upload is checked against its
+  chunk signature, and trailing checksums (`x-amz-checksum-*`) go on to the bucket, which checks them.
+- `.rift/` isn't reachable through rift, so clients can't read or overwrite packs and manifests.
+- Logs never contain signatures or keys, also with `RIFT_DEBUG=1`, which logs every request.
+
+**Limits.** Past these, a client gets 413 or 503 `SlowDown`; registries and S3 clients retry 503s.
+
+| Flag | Default | Bounds |
+|---|---|---|
+| `--max-body-mb` | 1024 | one request body (registries upload in parts far smaller) |
+| `--max-requests` | 512 | requests in flight |
+| `--max-cold-reads` | 4 | rebuilds at once; more wait up to a minute |
+| `--max-spill-gb` | 16 | temp disk for rebuilt blobs waiting on slow clients; keep it under the temp volume (the chart's `/tmp` is 20Gi) |
+
+A rebuild writes to a temp file as fast as it can and the client reads it at its own pace, so a slow
+download holds temp disk, never a rebuild slot. Temp files a killed rift leaves behind are deleted
+after an hour.
+
+**TLS.** `--tls-cert cert.pem --tls-key key.pem` serves HTTPS (the certificate file can carry
+intermediates). With the chart: `kubectl create secret tls rift-tls --cert=… --key=…` and
+`--set tls.secretName=rift-tls`. Then give the registry `https://rift:9100` and `secure: true`
+(GitLab: `'secure' => true`), and make sure it trusts the CA. Without TLS, keep rift on a private
+network: signatures stop tampering and replays, but blob contents cross the network in the clear.
+
+**Keys and network**
+
+- The backend key is the only one that reaches the bucket itself; scope it to that bucket. The
+  client keys only work at rift. Rotate them by changing the Secret and the registry's config
+  together; rift reads keys at start.
+- Only the registry needs to reach rift, plus the machines that pull if redirects are on (presigned
+  URLs point at rift). Admit just those with a NetworkPolicy or security group; the limits above
+  bound what anyone else could do.
+- The limits count requests, not connections. rift's HTTP server has no timeout for a client that
+  connects and then stalls before sending a whole request (slowloris). If anything untrusted can
+  reach rift, put a proxy or load balancer with client timeouts in front of it.
+- `/-/metrics` and `/-/healthz` answer without a signature (counts and sizes, no keys or names) on
+  the same port; keep them inside too.
+- rift's own writes (packs, manifests, hot copies) carry no encryption headers, so they get the
+  bucket's default encryption. Set SSE-S3 or SSE-KMS as the bucket default. A bucket policy that
+  requires `x-amz-server-side-encryption` on every PUT will refuse rift's writes. The registry's own
+  encryption settings pass through unchanged.
+
+## 6. What happens next
 
 - **Right away:** nothing changes. rift passes every request through to the bucket.
 - **After `--cold-after` (default 7 days with no write or read):** blobs are compacted. preflate
@@ -112,7 +163,7 @@ endpoint as well as the registry.
 - **Deletes and registry garbage collection** work as before. rift drops the deleted blobs and
   reclaims their packs after `--gc-grace` (default 10 minutes).
 
-## 6. Watching it
+## 7. Watching it
 
 - `GET /-/metrics` is Prometheus format (the chart adds scrape annotations). The ones that matter:
   - `rift_bucket_logical_bytes`, `rift_bucket_stored_bytes` and `rift_bucket_saved_ratio`: what the
@@ -124,7 +175,7 @@ endpoint as well as the registry.
 - `GET /-/healthz` answers `{"status":"ok","compacted":N}`.
 - The log has a line for every compaction batch, garbage collection, and hot copy stubbed again.
 
-## 7. Leaving
+## 8. Leaving
 
 1. Stop rift.
 2. Run `rift eject --backend https://s3.us-east-1.amazonaws.com --bucket my-registry --yes`, with
@@ -133,7 +184,7 @@ endpoint as well as the registry.
    fix the cause and run it again.
 3. Point the registry back at the bucket.
 
-## 8. Limits of this pilot build
+## 9. Limits of this pilot build
 
 - One rift per bucket; there's no high availability yet. While rift is down, pulls of compacted
   blobs wait for it (recent blobs are in the bucket as they were).
@@ -141,6 +192,6 @@ endpoint as well as the registry.
   pushes are a small daily stream.
 - A cold pull of a big layer on few cores is slower than a plain download, about 2–3× on 6 cores.
 - gzip layers only; zstd and eStargz layers are left as they are.
+- No timeout for clients that connect and stall mid-request (see Security).
 - Tested end to end with distribution 2.8.3, Harbor 2.14.6 and GitLab's registry 4.41 (classic
   metadata) on MinIO; not yet on AWS S3 at scale.
-- No metrics endpoint yet, only logs.
