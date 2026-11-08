@@ -1,0 +1,7 @@
+rift
+Copyright 2026 Oleg Nazarov
+
+This product includes preflate-rs (https://github.com/microsoft/preflate-rs),
+Copyright (c) Microsoft Corporation, licensed under the Apache License 2.0.
+A modified copy is vendored in vendor/preflate-rs; vendor/preflate-rs/README.md
+lists the changes, and each changed file says so in its first line.

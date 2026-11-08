@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Byte-exact recompression for container registries and object storage"
 license = "Apache-2.0"
+repository = "https://github.com/olegnazarov23/rift"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"

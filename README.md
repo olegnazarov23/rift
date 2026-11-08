@@ -2,8 +2,16 @@
 
 Byte-exact recompression for container registries and object storage.
 
-`rift scan` tells you how much smaller your data would be. It only reads. Every blob it
-recompresses is rebuilt in memory and compared with the original before it counts.
+- `rift gateway` is an S3 endpoint in front of the bucket your registry already uses
+  (distribution, Harbor, GitLab). Blobs nobody has touched for a while are stored smaller, and
+  every byte comes back exactly as it was pushed, so digests never change.
+- `rift scan` tells you how much smaller your data would be. It only reads. Every blob it
+  recompresses is rebuilt in memory and compared with the original before it counts.
+
+**Status: early.** Tested end to end on MinIO under distribution 2.8, Harbor 2.14 and GitLab's
+registry 4.41: 39–59% less storage on our test images. The same chunk store saved 79% on 30
+consecutive CI builds of one project. Not yet run on AWS S3 at scale. To try it on your registry, see
+[docs/PILOT.md](docs/PILOT.md).
 
 ## Scan a registry
 
@@ -102,3 +110,8 @@ every remaining blob stayed byte-exact.
 preflate-rs is vendored in `vendor/preflate-rs` (our branch of microsoft/preflate-rs with restart
 points; refresh it with `scripts/vendor-preflate.sh`). Lepton comes from crates.io. A Helm chart is
 in `deploy/helm/rift`.
+
+## License
+
+Apache-2.0, see [LICENSE](LICENSE). `vendor/preflate-rs` is Microsoft's preflate-rs, also
+Apache-2.0, with our changes ([NOTICE](NOTICE)). Security reports: [SECURITY.md](SECURITY.md).
