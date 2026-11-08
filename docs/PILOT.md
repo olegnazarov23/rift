@@ -28,8 +28,9 @@ On our tests: 64% less on official Docker Hub images, 79% on 30 consecutive CI b
 
 ## 3. Run rift
 
-Build the image with `docker build -t rift:0.1.0 .` and push it where your cluster can pull it
-(set `image.repository` in the chart). Two sets of keys go in the environment:
+The image is `ghcr.io/olegnazarov23/rift:0.1.0`, for amd64 and arm64; the chart uses it by default.
+To build your own, run `docker build -t rift:0.1.0 .` and set `image.repository`. Two sets of keys go
+in the environment:
 
 | Variable | What it is |
 |---|---|
@@ -67,7 +68,7 @@ With Helm:
 
 With Docker:
 
-    docker run -d --name rift -p 9100:9100 --env-file rift.env rift:0.1.0 \
+    docker run -d --name rift -p 9100:9100 --env-file rift.env ghcr.io/olegnazarov23/rift:0.1.0 \
       gateway --listen 0.0.0.0:9100 --backend https://s3.us-east-1.amazonaws.com --bucket my-registry
 
 ## 4. Point the registry at rift
