@@ -111,8 +111,8 @@ registry['storage'] = {
 `s3_v2` sends request checksums by default. Leave them on in front of AWS S3. If the bucket is on
 MinIO, set `'checksum_disabled' => true` as GitLab's docs say: MinIO rejects the multipart copies
 GitLab makes for blobs over 32 MB when checksums are on, with or without rift in between. Tested
-with GitLab's registry 4.41 in its classic (non-database) metadata mode; the metadata-database
-mode isn't tested yet.
+with GitLab's registry 4.41 in both metadata modes: classic, and the metadata database GitLab is
+moving to, whose online garbage collection deletes through rift.
 
 **Redirects (optional, later).** Registries can send clients straight to storage for blob
 downloads. To keep that, turn redirects back on and start rift with
@@ -218,5 +218,5 @@ network: signatures stop tampering and replays, but blob contents cross the netw
 - A cold pull of a big layer on few cores is slower than a plain download, about 2–3× on 6 cores.
 - gzip layers only; zstd and eStargz layers are left as they are.
 - No timeout for clients that connect and stall mid-request (see Security).
-- Tested end to end with distribution 2.8.3, Harbor 2.14.6 and GitLab's registry 4.41 (classic
-  metadata) on MinIO; not yet on AWS S3 at scale.
+- Tested end to end with distribution 2.8.3, Harbor 2.14.6 and GitLab's registry 4.41 (both
+  metadata modes) on MinIO; not yet on AWS S3 at scale.
