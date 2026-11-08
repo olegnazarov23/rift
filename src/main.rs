@@ -109,7 +109,7 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
         bail!("set RIFT_CLIENT_ACCESS_KEY and RIFT_CLIENT_SECRET_KEY to listen beyond localhost");
     }
     let threads = args.threads.unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
-    let store = Arc::new(cas::Store::open(Arc::new(backend), args.pack_level, 64)?);
+    let store = Arc::new(cas::Store::open(Arc::new(backend), args.pack_level, 64, threads)?);
     eprintln!(
         "rift gateway on {} for {}/{bucket}: {} compacted blobs, compacting after {} cold, client signatures {}",
         args.listen,

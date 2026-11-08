@@ -15,7 +15,7 @@ use std::{
     thread,
 };
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use fastcdc::v2020::FastCDC;
 use preflate_rs::{IndependentRecipe, PreflateConfig, RebuiltGroup, Splicer, preflate_independent};
 use serde_json::{Value, json};
@@ -194,9 +194,9 @@ fn parallel<R: Send>(n: usize, threads: usize, f: impl Fn(usize) -> R + Sync) ->
     out.into_iter().map(|m| m.into_inner().unwrap().expect("every index ran")).collect()
 }
 
-/// Unpacks a single-member gzip blob and rebuilds it from the recipe, checking the result hashes to
-/// `digest`. Returns the manifest (no chunk refs yet) and the plain text, or None when the blob
-/// isn't gzip or can't be rebuilt exactly.
+/// Unpacks a single-member gzip blob. Returns the manifest without chunk refs or group positions
+/// (`end` holds just the gzip trailer until `complete`) and the plain text, or None when the blob
+/// isn't gzip preflate can take.
 pub fn analyze(key: &str, digest: &str, mtime: u64, data: &[u8], threads: usize) -> Result<Option<(Manifest, Vec<u8>)>> {
     let Some(start) = gzip_payload_offset(data) else { return Ok(None) };
     let config = PreflateConfig { max_chain_length: 4096, plain_text_limit: 4 << 30, verify_compression: false };
@@ -206,55 +206,79 @@ pub fn analyze(key: &str, digest: &str, mtime: u64, data: &[u8], threads: usize)
     if start + deflate_len + 8 != data.len() {
         return Ok(None);
     }
-    let recipe = IndependentRecipe::parse(&raw).map_err(|e| anyhow!("{e:?}"))?;
-    let parts = parallel(recipe.groups(), threads, |g| {
-        let (base, _, end) = recipe.plain_range(g);
-        recipe.recreate_group(g, &plain[base..end])
-    });
-    let mut sha = Sha256::new();
-    sha.update(&data[..start]);
-    let (mut splicer, mut at, mut groups) = (Splicer::default(), start as u64, Vec::new());
-    for part in parts {
-        let Ok(part) = part else { return Ok(None) };
-        groups.push((at, splicer.carry()));
-        let bytes = splicer.push(part);
-        sha.update(&bytes);
-        at += bytes.len() as u64;
-    }
-    let mut end: Vec<u8> = splicer.finish().into_iter().collect();
-    end.extend_from_slice(&data[start + deflate_len..]);
-    sha.update(&end);
-    if at + end.len() as u64 != data.len() as u64 || hex(&sha.finalize()) != digest {
-        return Ok(None);
-    }
+    let trailer = data[start + deflate_len..].to_vec();
     let recipe = zstd::bulk::compress(&raw, 19)?;
-    let m = Manifest::new(key.into(), data.len() as u64, digest.into(), mtime, data[..start].to_vec(), end, groups, Vec::new(), recipe);
+    let m = Manifest::new(key.into(), data.len() as u64, digest.into(), mtime, data[..start].to_vec(), trailer, Vec::new(), Vec::new(), recipe);
     Ok(Some((m, plain)))
+}
+
+/// Rebuilds the blob from its chunks, records where each group's bytes land and checks the result
+/// against the digest. False when it doesn't match; the manifest is then incomplete.
+pub fn complete(m: &mut Manifest, workers: usize, pack: &PackFn) -> Result<bool> {
+    let (groups, end, digest) = {
+        let recipe = m.recipe()?;
+        let mut sha = Sha256::new();
+        sha.update(&m.head);
+        let (mut splicer, mut at, mut groups) = (Splicer::default(), m.head.len() as u64, Vec::new());
+        rebuild_groups(m, recipe, 0, recipe.groups(), workers, pack, &mut |_, part| {
+            groups.push((at, splicer.carry()));
+            let bytes = splicer.push(part);
+            sha.update(&bytes);
+            at += bytes.len() as u64;
+            true
+        })?;
+        let mut end: Vec<u8> = splicer.finish().into_iter().collect();
+        end.extend_from_slice(&m.end);
+        sha.update(&end);
+        if at + end.len() as u64 != m.size {
+            return Ok(false);
+        }
+        (groups, end, hex(&sha.finalize()))
+    };
+    if digest != m.sha256 {
+        return Ok(false);
+    }
+    m.groups = groups;
+    m.end = end;
+    Ok(true)
 }
 
 /// hash, offset, length of a chunk inside its pack
 type Entry = ([u8; 32], u32, u32);
 
-/// Puts unique chunks into packs. A full pack is handed to `store(id, zstd bytes, index bytes)`.
+/// Puts unique chunks into packs. Full packs queue up and are compressed in parallel, then handed to
+/// `store(id, zstd bytes, index bytes)`; a chunk is only safe to rely on after `flush` succeeds.
 pub struct Packer {
     index: HashMap<[u8; 32], Ref>,
-    /// chunks and stored size of every pack
+    /// chunks and stored size of every stored pack
     packs: HashMap<u32, (Vec<Entry>, u64)>,
     id: u32,
     data: Vec<u8>,
     entries: Vec<Entry>,
+    /// full packs not stored yet
+    queued: Vec<(u32, Vec<u8>, Vec<Entry>)>,
     level: i32,
+    threads: usize,
 }
 
-pub type PackSink<'a> = dyn FnMut(u32, Vec<u8>, Vec<u8>) -> Result<()> + 'a;
+pub type PackStore<'a> = dyn Fn(u32, Vec<u8>, Vec<u8>) -> Result<()> + Sync + 'a;
 
 impl Packer {
-    pub fn new(packs: HashMap<u32, (Vec<Entry>, u64)>, index: HashMap<[u8; 32], Ref>, next_id: u32, level: i32) -> Self {
-        Self { index, packs, id: next_id, data: Vec::with_capacity(PACK_BYTES), entries: Vec::new(), level }
+    pub fn new(packs: HashMap<u32, (Vec<Entry>, u64)>, index: HashMap<[u8; 32], Ref>, next_id: u32, level: i32, threads: usize) -> Self {
+        Self {
+            index,
+            packs,
+            id: next_id,
+            data: Vec::with_capacity(PACK_BYTES),
+            entries: Vec::new(),
+            queued: Vec::new(),
+            level,
+            threads: threads.max(1),
+        }
     }
 
     /// Cuts `plain` into chunks and returns their refs; new chunks go into the open pack.
-    pub fn add(&mut self, plain: &[u8], store: &mut PackSink) -> Result<Vec<Ref>> {
+    pub fn add(&mut self, plain: &[u8], store: &PackStore) -> Result<Vec<Ref>> {
         FastCDC::new(plain, 16 << 10, 64 << 10, 256 << 10)
             .map(|c| {
                 let bytes = &plain[c.offset..c.offset + c.length];
@@ -264,12 +288,15 @@ impl Packer {
     }
 
     /// Where an identical chunk is already stored, or where this one goes in the open pack.
-    pub fn add_chunk(&mut self, hash: [u8; 32], bytes: &[u8], store: &mut PackSink) -> Result<Ref> {
+    pub fn add_chunk(&mut self, hash: [u8; 32], bytes: &[u8], store: &PackStore) -> Result<Ref> {
         if let Some(r) = self.index.get(&hash) {
             return Ok(*r);
         }
         if self.data.len() + bytes.len() > PACK_BYTES {
-            self.seal(store)?;
+            self.close();
+            if self.queued.len() >= self.threads {
+                self.flush(store)?;
+            }
         }
         let r = [self.id, self.data.len() as u32, bytes.len() as u32];
         self.data.extend_from_slice(bytes);
@@ -278,41 +305,53 @@ impl Packer {
         Ok(r)
     }
 
-    /// Stores the open pack, if it holds anything. On failure its chunks are forgotten, so nothing
-    /// later refers to them.
-    pub fn seal(&mut self, store: &mut PackSink) -> Result<()> {
-        if self.data.is_empty() {
-            return Ok(());
+    /// Queues the open pack.
+    fn close(&mut self) {
+        if !self.data.is_empty() {
+            let data = std::mem::replace(&mut self.data, Vec::with_capacity(PACK_BYTES));
+            self.queued.push((self.id, data, std::mem::take(&mut self.entries)));
+            self.id += 1;
         }
-        let stored = (|| {
-            let mut z = zstd::bulk::Compressor::new(self.level)?;
+    }
+
+    /// Compresses and stores every queued pack and the open one, in parallel. Chunks of a pack that
+    /// fails to store are forgotten, so nothing later refers to them.
+    pub fn flush(&mut self, store: &PackStore) -> Result<()> {
+        self.close();
+        let queued = std::mem::take(&mut self.queued);
+        let level = self.level;
+        let results = parallel(queued.len(), self.threads, |i| -> Result<u64> {
+            let (id, data, entries) = &queued[i];
+            let mut z = zstd::bulk::Compressor::new(level)?;
             z.set_parameter(CParameter::EnableLongDistanceMatching(true))?;
             z.set_parameter(CParameter::WindowLog(24))?;
-            let mut idx = Vec::with_capacity(self.entries.len() * 40);
-            for (h, at, len) in &self.entries {
+            let mut idx = Vec::with_capacity(entries.len() * 40);
+            for (h, at, len) in entries {
                 idx.extend(h);
                 idx.extend(at.to_le_bytes());
                 idx.extend(len.to_le_bytes());
             }
-            let z = z.compress(&self.data)?;
+            let z = z.compress(data)?;
             let size = z.len() as u64;
-            store(self.id, z, idx).map(|_| size)
-        })();
-        let entries = std::mem::take(&mut self.entries);
-        self.data.clear();
-        match stored {
-            Ok(size) => {
-                self.packs.insert(self.id, (entries, size));
-                self.id += 1;
-                Ok(())
-            }
-            Err(e) => {
-                for (h, ..) in &entries {
-                    self.index.remove(h);
+            store(*id, z, idx).map(|_| size)
+        });
+        let mut failed = None;
+        for ((id, _, entries), result) in queued.into_iter().zip(results) {
+            match result {
+                Ok(size) => {
+                    self.packs.insert(id, (entries, size));
                 }
-                Err(e)
+                Err(e) => {
+                    for (h, ..) in &entries {
+                        if self.index.get(h).is_some_and(|r| r[0] == id) {
+                            self.index.remove(h);
+                        }
+                    }
+                    failed.get_or_insert(e.context(format!("storing pack {id}")));
+                }
             }
         }
+        failed.map_or(Ok(()), Err)
     }
 
     /// Drops packs that are about to be deleted, so nothing new refers to their chunks. Returns
@@ -372,16 +411,110 @@ impl PackCache {
     }
 }
 
-/// Streams bytes `start..end` of the blob into `sink`, rebuilding groups on `workers` threads ahead
-/// of the writer. Stops early when `sink` returns false.
-pub fn stream(
+/// Fetches a decompressed pack.
+pub type PackFn<'a> = dyn Fn(u32) -> Result<Arc<Vec<u8>>> + Sync + 'a;
+
+/// Rebuilds groups `g0..g1` on `workers` threads ahead of the consumer and hands them to `take` in
+/// order; stops early when `take` returns false.
+fn rebuild_groups(
     m: &Manifest,
-    start: u64,
-    end: u64,
+    recipe: &IndependentRecipe,
+    g0: usize,
+    g1: usize,
     workers: usize,
-    pack: &(dyn Fn(u32) -> Result<Arc<Vec<u8>>> + Sync),
-    sink: &mut dyn FnMut(&[u8]) -> bool,
+    pack: &PackFn,
+    take: &mut dyn FnMut(usize, RebuiltGroup) -> bool,
 ) -> Result<()> {
+    let n = g1.saturating_sub(g0);
+    let lookahead = workers.max(1) * 2;
+    let slots: Vec<Mutex<Option<Result<RebuiltGroup>>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let (next, emitted, stop, progress) = (AtomicUsize::new(0), Mutex::new(0usize), AtomicBool::new(false), Condvar::new());
+    let rebuild = |g: usize| -> Result<RebuiltGroup> {
+        let (base, _, gend) = recipe.plain_range(g);
+        let (base, gend) = (base as u64, gend as u64);
+        let first = m.ref_start.partition_point(|&s| s <= base).saturating_sub(1);
+        let last = m.ref_start.partition_point(|&s| s < gend);
+        // the group's packs load in parallel
+        let mut ids: Vec<u32> = m.refs[first..last].iter().map(|r| r[0]).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let loaded: Vec<Result<Arc<Vec<u8>>>> = thread::scope(|s| {
+            let handles: Vec<_> = ids.iter().map(|&id| s.spawn(move || pack(id))).collect();
+            handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("pack loader panicked")))).collect()
+        });
+        let mut packs = HashMap::new();
+        for (id, p) in ids.iter().zip(loaded) {
+            packs.insert(*id, p?);
+        }
+        let mut window = Vec::with_capacity((gend - base) as usize);
+        for i in first..last {
+            let [p, at, len] = m.refs[i];
+            let chunk = packs[&p].get(at as usize..(at + len) as usize).context("chunk outside its pack")?;
+            let cs = m.ref_start[i];
+            let (lo, hi) = (cs.max(base), (cs + u64::from(len)).min(gend));
+            window.extend_from_slice(&chunk[(lo - cs) as usize..(hi - cs) as usize]);
+        }
+        recipe.recreate_group(g, &window).map_err(|e| anyhow!("{}: group {g}: {e:?}", m.key))
+    };
+    thread::scope(|s| {
+        for _ in 0..workers.clamp(1, n.max(1)) {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n || stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    {
+                        let mut e = emitted.lock().unwrap();
+                        while i >= *e + lookahead && !stop.load(Ordering::Relaxed) {
+                            e = progress.wait(e).unwrap();
+                        }
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let part = rebuild(g0 + i);
+                    *slots[i].lock().unwrap() = Some(part);
+                    let _e = emitted.lock().unwrap();
+                    progress.notify_all();
+                }
+            });
+        }
+        let mut outcome = Ok(());
+        for i in 0..n {
+            let part = {
+                let mut e = emitted.lock().unwrap();
+                loop {
+                    if let Some(p) = slots[i].lock().unwrap().take() {
+                        break p;
+                    }
+                    e = progress.wait(e).unwrap();
+                }
+            };
+            match part {
+                Ok(p) => {
+                    if !take(g0 + i, p) {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    outcome = Err(e);
+                    break;
+                }
+            }
+            *emitted.lock().unwrap() = i + 1;
+            progress.notify_all();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _e = emitted.lock().unwrap();
+        progress.notify_all();
+        outcome
+    })
+}
+
+/// Streams bytes `start..end` of a completed blob into `sink`, rebuilding groups on `workers`
+/// threads ahead of the writer. Stops early when `sink` returns false.
+pub fn stream(m: &Manifest, start: u64, end: u64, workers: usize, pack: &PackFn, sink: &mut dyn FnMut(&[u8]) -> bool) -> Result<()> {
     let head_len = m.head.len() as u64;
     let end_at = m.size - m.end.len() as u64;
     let clip = |at: u64, len: usize| {
@@ -398,97 +531,20 @@ pub fn stream(
         ensure!(recipe.groups() == m.groups.len(), "{}: recipe and manifest disagree", m.key);
         let g0 = m.groups.partition_point(|&(at, _)| at <= start.max(head_len)).saturating_sub(1);
         let g1 = m.groups.partition_point(|&(at, _)| at < end.min(end_at));
-        let n = g1.saturating_sub(g0);
-        let lookahead = workers.max(1) * 2;
-        let slots: Vec<Mutex<Option<Result<RebuiltGroup>>>> = (0..n).map(|_| Mutex::new(None)).collect();
-        let (next, emitted, stop, progress) = (AtomicUsize::new(0), Mutex::new(0usize), AtomicBool::new(false), Condvar::new());
-        let rebuild = |g: usize| -> Result<RebuiltGroup> {
-            let (base, _, gend) = recipe.plain_range(g);
-            let (base, gend) = (base as u64, gend as u64);
-            let first = m.ref_start.partition_point(|&s| s <= base).saturating_sub(1);
-            let last = m.ref_start.partition_point(|&s| s < gend);
-            // the group's packs load in parallel
-            let mut ids: Vec<u32> = m.refs[first..last].iter().map(|r| r[0]).collect();
-            ids.sort_unstable();
-            ids.dedup();
-            let loaded: Vec<Result<Arc<Vec<u8>>>> = thread::scope(|s| {
-                let handles: Vec<_> = ids.iter().map(|&id| s.spawn(move || pack(id))).collect();
-                handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("pack loader panicked")))).collect()
-            });
-            let mut packs = HashMap::new();
-            for (id, p) in ids.iter().zip(loaded) {
-                packs.insert(*id, p?);
+        let mut splicer = Splicer::resume(m.groups[g0].1);
+        let mut stopped = false;
+        rebuild_groups(m, recipe, g0, g1, workers, pack, &mut |g, part| {
+            let bytes = splicer.push(part);
+            if let Some(r) = clip(m.groups[g].0, bytes.len())
+                && !sink(&bytes[r])
+            {
+                stopped = true;
+                return false;
             }
-            let mut window = Vec::with_capacity((gend - base) as usize);
-            for i in first..last {
-                let [p, at, len] = m.refs[i];
-                let chunk = packs[&p].get(at as usize..(at + len) as usize).context("chunk outside its pack")?;
-                let cs = m.ref_start[i];
-                let (lo, hi) = (cs.max(base), (cs + u64::from(len)).min(gend));
-                window.extend_from_slice(&chunk[(lo - cs) as usize..(hi - cs) as usize]);
-            }
-            recipe.recreate_group(g, &window).map_err(|e| anyhow!("{}: group {g}: {e:?}", m.key))
-        };
-        let result = thread::scope(|s| {
-            for _ in 0..workers.clamp(1, n.max(1)) {
-                s.spawn(|| {
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= n || stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        {
-                            let mut e = emitted.lock().unwrap();
-                            while i >= *e + lookahead && !stop.load(Ordering::Relaxed) {
-                                e = progress.wait(e).unwrap();
-                            }
-                        }
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let part = rebuild(g0 + i);
-                        *slots[i].lock().unwrap() = Some(part);
-                        let _e = emitted.lock().unwrap();
-                        progress.notify_all();
-                    }
-                });
-            }
-            let mut splicer = Splicer::resume(m.groups[g0].1);
-            let mut outcome = Ok(());
-            for i in 0..n {
-                let part = {
-                    let mut e = emitted.lock().unwrap();
-                    loop {
-                        if let Some(p) = slots[i].lock().unwrap().take() {
-                            break p;
-                        }
-                        e = progress.wait(e).unwrap();
-                    }
-                };
-                let bytes = match part {
-                    Ok(p) => splicer.push(p),
-                    Err(e) => {
-                        outcome = Err(e);
-                        break;
-                    }
-                };
-                if let Some(r) = clip(m.groups[g0 + i].0, bytes.len())
-                    && !sink(&bytes[r])
-                {
-                    outcome = Err(anyhow!("stopped"));
-                    break;
-                }
-                *emitted.lock().unwrap() = i + 1;
-                progress.notify_all();
-            }
-            stop.store(true, Ordering::Relaxed);
-            let _e = emitted.lock().unwrap();
-            progress.notify_all();
-            outcome
-        });
-        match result {
-            Err(e) if e.to_string() == "stopped" => return Ok(()),
-            other => other?,
+            true
+        })?;
+        if stopped {
+            return Ok(());
         }
     }
     if let Some(r) = clip(end_at, m.end.len()) {
@@ -534,7 +590,7 @@ fn manifest_key(key: &str) -> String {
 
 impl Store {
     /// Loads the chunk index and the manifests already in the bucket.
-    pub fn open(backend: Arc<Backend>, level: i32, cache_packs: usize) -> Result<Self> {
+    pub fn open(backend: Arc<Backend>, level: i32, cache_packs: usize, threads: usize) -> Result<Self> {
         let listing = backend.list(PACKS)?;
         let name = |key: &str| -> Option<(u32, String)> {
             let (id, ext) = key.strip_prefix(PACKS)?.split_once('.')?;
@@ -580,7 +636,7 @@ impl Store {
             backend,
             cache: PackCache::new(cache_packs),
             compacted: RwLock::new(compacted),
-            packer: Mutex::new(Packer::new(packs, index, next, level)),
+            packer: Mutex::new(Packer::new(packs, index, next, level, threads)),
             mutations: Mutex::new(()),
             retired: Mutex::new(Vec::new()),
             forgotten: AtomicUsize::new(0),
@@ -681,11 +737,11 @@ impl Store {
                 let used = &live[id];
                 for &(h, at, len) in entries.iter().filter(|e| used.contains(&e.1)) {
                     let bytes = data.get(at as usize..(at + len) as usize).context("chunk outside its pack")?;
-                    let r = packer.add_chunk(h, bytes, &mut |i, z, x| self.store_pack(i, z, x))?;
+                    let r = packer.add_chunk(h, bytes, &|i, z, x| self.store_pack(i, z, x))?;
                     moved.insert((*id, at), r);
                 }
             }
-            packer.seal(&mut |i, z, x| self.store_pack(i, z, x))
+            packer.flush(&|i, z, x| self.store_pack(i, z, x))
         })();
         if let Err(e) = copied {
             // dedup finds the originals again; partial copies are unreferenced and go next time
@@ -741,7 +797,7 @@ impl Store {
                 let (data, etag) = self.backend.get(key)?;
                 ensure!(sha256_hex(&data) == *digest, "content doesn't match its digest");
                 let Some((mut m, plain)) = analyze(key, digest, *mtime, &data, threads)? else { return Ok(None) };
-                let refs = self.packer.lock().unwrap().add(&plain, &mut |id, z, idx| self.store_pack(id, z, idx))?;
+                let refs = self.packer.lock().unwrap().add(&plain, &|id, z, idx| self.store_pack(id, z, idx))?;
                 m.set_refs(refs);
                 Ok(Some((m, etag)))
             })();
@@ -751,7 +807,7 @@ impl Store {
                 Err(e) => eprintln!("rift: {key}: {e:#}"),
             }
         }
-        if let Err(e) = self.packer.lock().unwrap().seal(&mut |id, z, idx| self.store_pack(id, z, idx)) {
+        if let Err(e) = self.packer.lock().unwrap().flush(&|id, z, idx| self.store_pack(id, z, idx)) {
             eprintln!("rift: storing a pack failed, its blobs stay as they were: {e:#}");
         }
         let (mut done, mut bytes) = (0, 0);
@@ -769,25 +825,15 @@ impl Store {
         (done, bytes)
     }
 
-    /// Writes the manifest, rebuilds the blob from what's stored (cold cache) and only then swaps the
-    /// original for a stub.
-    fn commit(&self, m: Manifest, etag: &str, threads: usize) -> Result<bool> {
+    /// Rebuilds the blob from what's stored (cold cache) and checks it against its digest, writes the
+    /// manifest, and only then swaps the original for a stub.
+    fn commit(&self, mut m: Manifest, etag: &str, threads: usize) -> Result<bool> {
         let key = m.key.clone();
-        self.backend.put(&manifest_key(&key), m.encode(), &[])?;
-        let fresh = PackCache::new(8);
-        let (mut sha, mut n) = (Sha256::new(), 0u64);
-        let rebuilt = stream(&m, 0, m.size, threads, &|id| fresh.get(id, &|id| self.fetch_pack(id)), &mut |b| {
-            sha.update(b);
-            n += b.len() as u64;
-            true
-        });
-        if rebuilt.is_err() || n != m.size || hex(&sha.finalize()) != m.sha256 {
-            let _ = self.backend.delete(&manifest_key(&key));
-            if let Err(e) = rebuilt {
-                bail!("rebuild from the store failed: {e:#}");
-            }
+        let fresh = PackCache::new(32);
+        if !complete(&mut m, threads, &|id| fresh.get(id, &|id| self.fetch_pack(id))).context("rebuild from the store")? {
             return Ok(false);
         }
+        self.backend.put(&manifest_key(&key), m.encode(), &[])?;
         let size = m.size;
         {
             let _m = self.mutations.lock().unwrap();
@@ -841,19 +887,20 @@ mod tests {
         }
         let blob = gzip(&text);
         let digest = sha256_hex(&blob);
-        let (mut m, plain) = analyze("k", &digest, 0, &blob, 4).unwrap().expect("rebuildable");
-        assert!(m.groups.len() > 1, "test needs several groups");
+        let (mut m, plain) = analyze("k", &digest, 0, &blob, 4).unwrap().expect("preflate takes it");
         let packs: Mutex<HashMap<u32, Arc<Vec<u8>>>> = Mutex::new(HashMap::new());
-        let mut packer = Packer::new(HashMap::new(), HashMap::new(), 0, 3);
-        let mut sink = |id: u32, z: Vec<u8>, _idx: Vec<u8>| {
+        let mut packer = Packer::new(HashMap::new(), HashMap::new(), 0, 3, 2);
+        let store = |id: u32, z: Vec<u8>, _idx: Vec<u8>| {
             packs.lock().unwrap().insert(id, Arc::new(zstd::bulk::decompress(&z, 64 << 20)?));
             Ok(())
         };
-        let refs = packer.add(&plain, &mut sink).unwrap();
-        packer.seal(&mut sink).unwrap();
+        let refs = packer.add(&plain, &store).unwrap();
+        packer.flush(&store).unwrap();
         m.set_refs(refs);
-        let m = Manifest::decode(&m.encode()).unwrap();
         let pack = |id: u32| packs.lock().unwrap().get(&id).cloned().context("missing pack");
+        assert!(complete(&mut m, 3, &pack).unwrap(), "rebuilds byte-exact");
+        assert!(m.groups.len() > 1, "test needs several groups");
+        let m = Manifest::decode(&m.encode()).unwrap();
         let size = blob.len() as u64;
         let cuts = [0, 1, 9, 10, 4096, size / 3, size / 2, m.groups[1].0, m.groups[1].0 + 1, size - 9, size - 1];
         for &a in &cuts {
