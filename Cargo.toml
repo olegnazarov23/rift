@@ -12,8 +12,8 @@ clap = { version = "4", features = ["derive"] }
 fastcdc = "3"
 hmac = "0.12"
 httpdate = "1"
-lepton_jpeg = { path = "../recompress-lab/tools/lepton_jpeg_rust/lib" }
-preflate-rs = { path = "../recompress-lab/tools/preflate-rs/preflate" }
+lepton_jpeg = "0.5.8"
+preflate-rs = { path = "vendor/preflate-rs" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde_json = "1"
 sha2 = "0.10"

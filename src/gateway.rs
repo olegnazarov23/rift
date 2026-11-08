@@ -203,6 +203,12 @@ impl Gateway {
 
     fn route(&self, req: Request, method: &str, url: &str) -> Result<()> {
         let (raw_path, raw_query) = url.split_once('?').unwrap_or((url, ""));
+        // no bucket name can start with '-'
+        if raw_path == "/-/healthz" {
+            let body = format!("{{\"status\":\"ok\",\"compacted\":{}}}\n", self.store.len());
+            req.respond(Response::from_data(body).with_header(h("content-type", "application/json")))?;
+            return Ok(());
+        }
         let headers: Vec<(String, String)> = req
             .headers()
             .iter()

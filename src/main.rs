@@ -43,6 +43,43 @@ enum Cmd {
     Scan(ScanArgs),
     /// Serve S3 in front of a bucket, compacting blobs that go cold
     Gateway(GatewayArgs),
+    /// Put every compacted blob back as it was and remove rift's data (stop the gateway first)
+    Eject(EjectArgs),
+}
+
+#[derive(Args)]
+struct EjectArgs {
+    /// The backing S3 endpoint
+    #[arg(long)]
+    backend: String,
+    #[arg(long)]
+    bucket: String,
+    #[arg(long, default_value = "us-east-1")]
+    region: String,
+    #[arg(long)]
+    threads: Option<usize>,
+    /// Do it; without this, only say what would happen
+    #[arg(long)]
+    yes: bool,
+}
+
+fn eject(args: &EjectArgs) -> Result<()> {
+    let env = |k: &str| std::env::var(k).with_context(|| format!("set {k}"));
+    let backend = s3::Backend::new(&args.backend, &args.bucket, &args.region, env("RIFT_BACKEND_ACCESS_KEY")?, env("RIFT_BACKEND_SECRET_KEY")?)?;
+    let threads = args.threads.unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
+    let store = cas::Store::open(Arc::new(backend), 19, 64, threads)?;
+    if !args.yes {
+        println!("{} compacted blobs in {}/{} would be put back as they were, then rift's packs deleted.", store.len(), args.backend, args.bucket);
+        println!("Stop the gateway first, then run again with --yes.");
+        return Ok(());
+    }
+    let (restored, failed, bytes) = store.eject(threads)?;
+    println!("put back {restored} blobs ({:.2} GB)", bytes as f64 / 1e9);
+    if failed > 0 {
+        bail!("{failed} blobs couldn't be put back; rift's packs were kept, so nothing is lost. Fix and run again.");
+    }
+    println!("rift's packs and manifests are gone; point the registry back at the bucket.");
+    Ok(())
 }
 
 #[derive(Args)]
@@ -519,5 +556,6 @@ fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Scan(args) => scan(&args),
         Cmd::Gateway(args) => gateway(&args),
+        Cmd::Eject(args) => eject(&args),
     }
 }

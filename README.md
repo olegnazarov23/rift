@@ -71,9 +71,15 @@ sign with the client keys, and set `redirect: disable: true`.
 - Chunk GC runs after deletes. Packs nothing uses are retired; packs under half used
   (`--gc-rewrite-below`) have their live chunks copied out first. Retired packs stay readable for
   `--gc-grace` (default 10m), so reads already streaming finish, then they're deleted.
+- After a full cold read, the original is put back in the bucket (a hot copy) until nobody has read
+  it for `--cold-after`; then the stub goes back (`--no-hot-copy` turns this off).
+- With `--redirect-endpoint`, a registry that redirects blob downloads to storage keeps doing so:
+  blobs stored as they are get a presigned redirect to the backend, and only cold ones stream
+  through rift.
+- `GET /-/healthz` for probes; `rift eject` puts every original back and removes rift's data.
 
-Not done yet: keeping a hot copy after a cold read, presigned-URL redirects, and more than one
-gateway per bucket.
+Running it for a pilot (Docker, Helm, registry settings, leaving): [docs/PILOT.md](docs/PILOT.md).
+Not done yet: more than one gateway per bucket, and metrics.
 
 Tested locally against distribution 2.8.3 and MinIO with 3 redis and 3 postgres images (69 blobs,
 577.7 MB). The bucket held 238.6 MB, 58.7% less. Every blob read back through the registry was
@@ -86,7 +92,8 @@ every remaining blob stayed byte-exact.
 
 ## Build
 
-    cargo build --release
+    cargo build --release          # or: docker build -t rift:0.1.0 .
 
-preflate-rs and lepton_jpeg are path dependencies on the lab's clones
-(`../recompress-lab/tools/`); rift needs the `restart-points` branch of preflate-rs.
+preflate-rs is vendored in `vendor/preflate-rs` (our branch of microsoft/preflate-rs with restart
+points; refresh it with `scripts/vendor-preflate.sh`). Lepton comes from crates.io. A Helm chart is
+in `deploy/helm/rift`.

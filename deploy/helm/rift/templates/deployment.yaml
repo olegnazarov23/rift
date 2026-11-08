@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rift.fullname" . }}
+  labels:
+    {{- include "rift.labels" . | nindent 4 }}
+spec:
+  # one gateway per bucket: two would compact and collect the same packs
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "rift.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rift.selector" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ toJson .Values | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+      containers:
+        - name: rift
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - gateway
+            - --listen=0.0.0.0:9100
+            - --backend={{ .Values.backend.endpoint }}
+            - --bucket={{ .Values.backend.bucket }}
+            - --region={{ .Values.backend.region }}
+            - --cold-after={{ .Values.compaction.coldAfter }}
+            - --interval={{ .Values.compaction.interval }}
+            - --min-size-mb={{ .Values.compaction.minSizeMB }}
+            - --pack-level={{ .Values.compaction.packLevel }}
+            - --gc-grace={{ .Values.gc.grace }}
+            - --gc-rewrite-below={{ .Values.gc.rewriteBelow }}
+            {{- with .Values.backend.redirectEndpoint }}
+            - --redirect-endpoint={{ . }}
+            {{- end }}
+            {{- if not .Values.compaction.hotCopy }}
+            - --no-hot-copy
+            {{- end }}
+            {{- with .Values.threads }}
+            - --threads={{ . }}
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ include "rift.secret" . }}
+          ports:
+            - name: s3
+              containerPort: 9100
+          readinessProbe:
+            httpGet:
+              path: /-/healthz
+              port: s3
+          livenessProbe:
+            httpGet:
+              path: /-/healthz
+              port: s3
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmp.sizeLimit }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

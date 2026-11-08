@@ -725,6 +725,58 @@ impl Store {
         Ok(())
     }
 
+    /// For leaving rift: puts every compacted blob's original bytes back (rebuilt and checked against
+    /// its digest first) and drops its manifest; deletes the packs only if every blob made it.
+    /// Returns (restored, failed, bytes restored). Run it with no gateway serving the bucket.
+    pub fn eject(&self, threads: usize) -> Result<(usize, usize, u64)> {
+        let mut manifests: Vec<Arc<Manifest>> = self.compacted.read().unwrap().values().cloned().collect();
+        manifests.sort_by(|a, b| a.key.cmp(&b.key));
+        let (mut restored, mut failed, mut bytes) = (0, 0, 0u64);
+        for m in manifests {
+            let tmp = std::env::temp_dir().join(format!("rift-eject-{}", std::process::id()));
+            let attempt = (|| -> Result<()> {
+                let mut file = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+                let (mut sha, mut n, mut io) = (Sha256::new(), 0u64, Ok(()));
+                self.stream(&m, 0, m.size, threads, &mut |b| {
+                    sha.update(b);
+                    n += b.len() as u64;
+                    io = std::io::Write::write_all(&mut file, b);
+                    io.is_ok()
+                })?;
+                io?;
+                std::io::Write::flush(&mut file)?;
+                drop(file);
+                ensure!(n == m.size && hex(&sha.finalize()) == m.sha256, "rebuild didn't match its digest");
+                match self.backend.head(&m.key)? {
+                    Some((0, etag)) => {
+                        self.backend.put_file(&m.key, std::fs::File::open(&tmp)?, m.size, &[("if-match".into(), etag)])?;
+                    }
+                    Some((size, _)) if size == m.size => {} // the original is already there
+                    _ => {}                                 // deleted: nothing to put back
+                }
+                self.backend.delete(&manifest_key(&m.key))
+            })();
+            let _ = std::fs::remove_file(&tmp);
+            match attempt {
+                Ok(()) => {
+                    restored += 1;
+                    bytes += m.size;
+                    eprintln!("rift: put back {} ({:.1} MB)", m.key, m.size as f64 / 1e6);
+                }
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("rift: {}: {e:#}", m.key);
+                }
+            }
+        }
+        if failed == 0 {
+            for o in self.backend.list(PACKS)? {
+                self.backend.delete(&o.key)?;
+            }
+        }
+        Ok((restored, failed, bytes))
+    }
+
     pub fn gc_due(&self) -> bool {
         self.forgotten.load(Ordering::Relaxed) > 0 || !self.retired.lock().unwrap().is_empty()
     }

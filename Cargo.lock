@@ -767,6 +767,8 @@ dependencies = [
 [[package]]
 name = "lepton_jpeg"
 version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "540c312fa0f528f4cad6c7dbffb0b29d39f34026e133a4c79d23d95f2863e46e"
 dependencies = [
  "bytemuck",
  "byteorder",

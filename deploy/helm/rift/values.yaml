@@ -1,0 +1,58 @@
+image:
+  repository: rift
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# The bucket your registry stores in today. rift keeps everything in it, under .rift/.
+backend:
+  endpoint: https://s3.us-east-1.amazonaws.com
+  bucket: my-registry
+  region: us-east-1
+  # The backend as clients reach it. Set it if the registry redirects blob downloads to storage:
+  # blobs stored as they are then go straight to S3 and only cold ones stream through rift.
+  redirectEndpoint: ""
+
+# Keys: "backend" lets rift read and write the bucket; "client" is what the registry signs with
+# when it talks to rift. Use an existing Secret with RIFT_BACKEND_ACCESS_KEY,
+# RIFT_BACKEND_SECRET_KEY, RIFT_CLIENT_ACCESS_KEY and RIFT_CLIENT_SECRET_KEY, or fill these in.
+credentials:
+  existingSecret: ""
+  backendAccessKey: ""
+  backendSecretKey: ""
+  clientAccessKey: ""
+  clientSecretKey: ""
+
+compaction:
+  # compact blobs nobody has written or read for this long
+  coldAfter: 7d
+  interval: 1m
+  minSizeMB: 1
+  packLevel: 19
+  # put a blob's original bytes back after a cold read, until it goes cold again
+  hotCopy: true
+
+gc:
+  # how long a pack no blob uses stays readable before it's deleted
+  grace: 10m
+  rewriteBelow: 0.5
+
+# Cold reads rebuild on these cores; compaction uses them too.
+threads: ""
+resources:
+  requests:
+    cpu: "2"
+    memory: 4Gi
+  limits:
+    memory: 8Gi
+
+# Hot copies are written here while a cold blob streams: size it for your largest layers.
+tmp:
+  sizeLimit: 20Gi
+
+service:
+  type: ClusterIP
+  port: 9100
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
