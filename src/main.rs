@@ -177,6 +177,7 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
         args.cold_after,
         if client_keys.is_some() { "checked" } else { "not checked" }
     );
+    store.publish_totals();
     let reads = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let schedule = gateway::Schedule {
         cold_after: seconds(&args.cold_after)?,
