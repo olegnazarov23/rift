@@ -50,6 +50,33 @@ On 136 unique blobs from 21 Docker Hub images (1.29 GB), the scan predicted 466.
 Building the real chunk store from the same blobs took 468.7 MB. With `--level 9` the scan
 predicts 522.7 MB: faster, and pessimistic by about 4 points.
 
+## Gateway
+
+`rift gateway` is the S3 endpoint your registry talks to, in front of its existing bucket:
+
+    RIFT_BACKEND_ACCESS_KEY=… RIFT_BACKEND_SECRET_KEY=… \
+    RIFT_CLIENT_ACCESS_KEY=… RIFT_CLIENT_SECRET_KEY=… \
+    rift gateway --backend https://s3.us-east-1.amazonaws.com --bucket my-registry --cold-after 7d
+
+Point the registry's S3 storage at it (distribution, Harbor and GitLab all take a `regionendpoint`),
+sign with the client keys, and set `redirect: disable: true`.
+
+- Requests pass through to the bucket, re-signed with the backend keys.
+- Blobs nobody has written or read for `--cold-after` are compacted. preflate unpacks them, the
+  content goes into deduplicated packs under `.rift/` in the same bucket, and each blob is rebuilt
+  from what was stored and checked against its digest. Only then is the original replaced by an
+  empty stub.
+- A read of a compacted blob streams the rebuild, byte ranges included. Listings show the original
+  size and date. Deleting a blob drops its manifest.
+
+Not done yet: garbage collection of chunks (packs keep the chunks of deleted blobs), keeping a hot
+copy after a cold read, presigned-URL redirects, and more than one gateway per bucket.
+
+Tested locally against distribution 2.8.3 and MinIO with 3 redis and 3 postgres images (69 blobs,
+577.7 MB). The bucket held 238.6 MB, 58.7% less. Every blob read back through the registry was
+byte-exact, `docker pull` from scratch worked and the image ran, and registry garbage collection
+deleted compacted blobs cleanly.
+
 ## Build
 
     cargo build --release
