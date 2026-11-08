@@ -99,6 +99,13 @@ impl Backend {
         Ok((resp.bytes()?.to_vec(), etag))
     }
 
+    /// Bytes `start..end` (fewer if the object is shorter).
+    pub fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+        let range = format!("bytes={start}-{}", end.saturating_sub(1).max(start));
+        let resp = Self::ok(self.send("GET", &Self::key_path(key), &[], &[("range".into(), range)], Vec::new())?, key)?;
+        Ok(resp.bytes()?.to_vec())
+    }
+
     /// Returns the new ETag.
     pub fn put(&self, key: &str, body: Vec<u8>, headers: &[(String, String)]) -> Result<String> {
         let resp = Self::ok(self.send("PUT", &Self::key_path(key), &[], headers, body)?, key)?;

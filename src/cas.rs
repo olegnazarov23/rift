@@ -137,10 +137,33 @@ impl Manifest {
         out
     }
 
-    pub fn decode(b: &[u8]) -> Result<Self> {
+    /// The header and where the chunk refs end, from a prefix of the encoded manifest.
+    fn header(b: &[u8]) -> Result<(Value, usize, usize)> {
         ensure!(b.len() > 12 && &b[..8] == MAGIC, "not a rift manifest");
         let hlen = u32::from_le_bytes(b[8..12].try_into()?) as usize;
         let h: Value = serde_json::from_slice(b.get(12..12 + hlen).context("short manifest")?)?;
+        let nrefs = h["refs"].as_u64().context("refs")? as usize;
+        Ok((h, 12 + hlen, 12 + hlen + nrefs * 12))
+    }
+
+    fn refs_from(b: &[u8], from: usize, to: usize) -> Result<Vec<Ref>> {
+        Ok(b.get(from..to)
+            .context("short manifest refs")?
+            .chunks_exact(12)
+            .map(|c| {
+                let v = |i: usize| u32::from_le_bytes(c[i..i + 4].try_into().expect("4 bytes"));
+                [v(0), v(4), v(8)]
+            })
+            .collect())
+    }
+
+    /// Roughly what it takes in memory.
+    fn bytes(&self) -> usize {
+        self.recipe.len() + self.refs.len() * 20 + self.groups.len() * 16 + self.head.len() + self.end.len() + 256
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self> {
+        let (h, refs_at, refs_end) = Self::header(b)?;
         let unhex = |v: &Value| -> Result<Vec<u8>> {
             let s = v.as_str().context("hex field")?;
             (0..s.len()).step_by(2).map(|i| Ok(u8::from_str_radix(&s[i..i + 2], 16)?)).collect()
@@ -151,16 +174,7 @@ impl Manifest {
             .iter()
             .map(|g| Ok((g[0].as_u64().context("group offset")?, g[1].as_u64().map(|c| c as u8))))
             .collect::<Result<Vec<_>>>()?;
-        let nrefs = h["refs"].as_u64().context("refs")? as usize;
-        let refs_at = 12 + hlen;
-        let refs_bytes = b.get(refs_at..refs_at + nrefs * 12).context("short manifest refs")?;
-        let refs = refs_bytes
-            .chunks_exact(12)
-            .map(|c| {
-                let v = |i: usize| u32::from_le_bytes(c[i..i + 4].try_into().expect("4 bytes"));
-                [v(0), v(4), v(8)]
-            })
-            .collect();
+        let refs = Self::refs_from(b, refs_at, refs_end)?;
         Ok(Self::new(
             h["key"].as_str().context("key")?.to_string(),
             h["size"].as_u64().context("size")?,
@@ -170,7 +184,7 @@ impl Manifest {
             unhex(&h["end"])?,
             groups,
             refs,
-            b[refs_at + nrefs * 12..].to_vec(),
+            b[refs_end..].to_vec(),
         ))
     }
 }
@@ -372,6 +386,51 @@ impl Packer {
     }
 }
 
+/// Manifests loaded from the bucket, least recently used dropped past a byte budget.
+pub struct ManifestCache {
+    inner: Mutex<(HashMap<String, (Arc<Manifest>, u64)>, usize, u64)>,
+    cap: usize,
+}
+
+impl ManifestCache {
+    pub fn new(cap: usize) -> Self {
+        Self { inner: Mutex::new((HashMap::new(), 0, 0)), cap }
+    }
+
+    pub fn get(&self, key: &str) -> Option<Arc<Manifest>> {
+        let mut g = self.inner.lock().unwrap();
+        g.2 += 1;
+        let tick = g.2;
+        g.0.get_mut(key).map(|(m, used)| {
+            *used = tick;
+            m.clone()
+        })
+    }
+
+    pub fn insert(&self, m: Arc<Manifest>) {
+        let mut g = self.inner.lock().unwrap();
+        let (map, total, tick) = &mut *g;
+        *tick += 1;
+        *total += m.bytes();
+        if let Some((old, _)) = map.insert(m.key.clone(), (m, *tick)) {
+            *total -= old.bytes();
+        }
+        while *total > self.cap && map.len() > 1 {
+            let oldest = map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k.clone()).expect("not empty");
+            if let Some((gone, _)) = map.remove(&oldest) {
+                *total -= gone.bytes();
+            }
+        }
+    }
+
+    pub fn remove(&self, key: &str) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some((gone, _)) = g.0.remove(key) {
+            g.1 -= gone.bytes();
+        }
+    }
+}
+
 /// Decompressed packs, most recently used kept.
 pub struct PackCache {
     cells: Mutex<(HashMap<u32, Arc<OnceLock<Option<Arc<Vec<u8>>>>>>, VecDeque<u32>)>,
@@ -553,11 +612,20 @@ pub fn stream(m: &Manifest, start: u64, end: u64, workers: usize, pack: &PackFn,
     Ok(())
 }
 
+/// What's kept in memory per compacted blob; its manifest is loaded when needed.
+#[derive(Clone, Copy)]
+pub struct BlobInfo {
+    pub size: u64,
+    pub mtime: u64,
+}
+
 /// The compacted blobs of one bucket.
 pub struct Store {
     pub backend: Arc<Backend>,
     cache: PackCache,
-    compacted: RwLock<HashMap<String, Arc<Manifest>>>,
+    /// every compacted blob; listing the manifests' names rebuilds this
+    compacted: RwLock<HashMap<String, BlobInfo>>,
+    manifests: ManifestCache,
     packer: Mutex<Packer>,
     /// held while a manifest is added, replaced or removed
     mutations: Mutex<()>,
@@ -588,13 +656,20 @@ fn idx_key(id: u32) -> String {
     format!("{PACKS}{id:08}.idx")
 }
 
-fn manifest_key(key: &str) -> String {
-    format!("{MANIFESTS}{key}")
+/// A manifest's name carries its blob's size and date, so a listing is enough to start.
+fn manifest_key(key: &str, info: BlobInfo) -> String {
+    format!("{MANIFESTS}{key}@{}@{}", info.size, info.mtime)
+}
+
+fn parse_manifest_key(name: &str) -> Option<(String, BlobInfo)> {
+    let (rest, mtime) = name.strip_prefix(MANIFESTS)?.rsplit_once('@')?;
+    let (key, size) = rest.rsplit_once('@')?;
+    Some((key.to_string(), BlobInfo { size: size.parse().ok()?, mtime: mtime.parse().ok()? }))
 }
 
 impl Store {
-    /// Loads the chunk index and the manifests already in the bucket.
-    pub fn open(backend: Arc<Backend>, level: i32, cache_packs: usize, threads: usize) -> Result<Self> {
+    /// Loads the chunk index and the catalog of compacted blobs.
+    pub fn open(backend: Arc<Backend>, level: i32, cache_packs: usize, threads: usize, manifest_cache: usize) -> Result<Self> {
         let listing = backend.list(PACKS)?;
         let name = |key: &str| -> Option<(u32, String)> {
             let (id, ext) = key.strip_prefix(PACKS)?.split_once('.')?;
@@ -633,13 +708,22 @@ impl Store {
         }
         let mut compacted = HashMap::new();
         for o in backend.list(MANIFESTS)? {
+            if let Some((key, info)) = parse_manifest_key(&o.key) {
+                compacted.insert(key, info);
+                continue;
+            }
+            // named before sizes went into the name: read it once and rename it
             let m = Manifest::decode(&backend.get(&o.key)?.0)?;
-            compacted.insert(m.key.clone(), Arc::new(m));
+            let info = BlobInfo { size: m.size, mtime: m.mtime };
+            backend.put(&manifest_key(&m.key, info), m.encode(), &[])?;
+            backend.delete(&o.key)?;
+            compacted.insert(m.key, info);
         }
         Ok(Self {
             backend,
             cache: PackCache::new(cache_packs),
             compacted: RwLock::new(compacted),
+            manifests: ManifestCache::new(manifest_cache),
             packer: Mutex::new(Packer::new(packs, index, next, level, threads)),
             mutations: Mutex::new(()),
             retired: Mutex::new(Vec::new()),
@@ -653,17 +737,43 @@ impl Store {
         self.compacted.read().unwrap().len()
     }
 
-    pub fn compacted(&self, key: &str) -> Option<Arc<Manifest>> {
-        self.compacted.read().unwrap().get(key).cloned()
+    pub fn info(&self, key: &str) -> Option<BlobInfo> {
+        self.compacted.read().unwrap().get(key).copied()
+    }
+
+    /// The manifest of a compacted blob, from the cache or the bucket.
+    pub fn manifest(&self, key: &str) -> Result<Option<Arc<Manifest>>> {
+        let Some(info) = self.info(key) else { return Ok(None) };
+        if let Some(m) = self.manifests.get(key) {
+            return Ok(Some(m));
+        }
+        let m = Arc::new(Manifest::decode(&self.backend.get(&manifest_key(key, info))?.0)?);
+        self.manifests.insert(m.clone());
+        Ok(Some(m))
+    }
+
+    /// A compacted blob's chunk refs, reading only that part of its manifest.
+    fn refs(&self, key: &str, info: BlobInfo) -> Result<Vec<Ref>> {
+        if let Some(m) = self.manifests.get(key) {
+            return Ok(m.refs.clone());
+        }
+        let name = manifest_key(key, info);
+        let mut b = self.backend.get_range(&name, 0, 64 << 10)?;
+        let (_, from, to) = Manifest::header(&b)?;
+        if b.len() < to {
+            b = self.backend.get_range(&name, 0, to as u64)?;
+        }
+        Manifest::refs_from(&b, from, to)
     }
 
     /// The key was deleted or overwritten: its manifest goes; GC reclaims its chunks.
     pub fn forget(&self, key: &str) {
         let _m = self.mutations.lock().unwrap();
         self.hot.lock().unwrap().remove(key);
-        if self.compacted.write().unwrap().remove(key).is_some() {
+        self.manifests.remove(key);
+        if let Some(info) = self.compacted.write().unwrap().remove(key) {
             self.forgotten.fetch_add(1, Ordering::Relaxed);
-            if let Err(e) = self.backend.delete(&manifest_key(key)) {
+            if let Err(e) = self.backend.delete(&manifest_key(key, info)) {
                 eprintln!("rift: could not delete the manifest of {key}: {e:#}");
             }
         }
@@ -672,11 +782,9 @@ impl Store {
     /// Points a still-compacted blob at moved chunks.
     fn replace_manifest(&self, m: Manifest) -> Result<()> {
         let _m = self.mutations.lock().unwrap();
-        if !self.compacted.read().unwrap().contains_key(&m.key) {
-            return Ok(()); // deleted meanwhile
-        }
-        self.backend.put(&manifest_key(&m.key), m.encode(), &[])?;
-        self.compacted.write().unwrap().insert(m.key.clone(), Arc::new(m));
+        let Some(info) = self.info(&m.key) else { return Ok(()) }; // deleted meanwhile
+        self.backend.put(&manifest_key(&m.key, info), m.encode(), &[])?;
+        self.manifests.insert(Arc::new(m));
         Ok(())
     }
 
@@ -700,7 +808,7 @@ impl Store {
     pub fn finish_hot_copy(&self, key: &str, file: &std::path::Path, size: u64) -> Result<()> {
         let done = (|| -> Result<()> {
             match self.backend.head(key)? {
-                Some((0, etag)) if self.compacted(key).is_some() => {
+                Some((0, etag)) if self.info(key).is_some() => {
                     self.backend.put_file(key, std::fs::File::open(file)?, size, &[("if-match".into(), etag)])?;
                     self.hot.lock().unwrap().insert(key.to_string(), unix_now());
                     crate::metrics::add(&crate::metrics::METRICS.hot_copies_made, 1);
@@ -720,8 +828,8 @@ impl Store {
 
     /// Swaps the stub back in over a hot copy nobody has read lately.
     pub fn cool(&self, key: &str, etag: &str) -> Result<()> {
-        let Some(m) = self.compacted(key) else { return Ok(()) };
-        self.backend.put(key, Vec::new(), &[("x-amz-meta-rift-size".into(), m.size.to_string()), ("if-match".into(), etag.to_string())])?;
+        let Some(info) = self.info(key) else { return Ok(()) };
+        self.backend.put(key, Vec::new(), &[("x-amz-meta-rift-size".into(), info.size.to_string()), ("if-match".into(), etag.to_string())])?;
         self.hot.lock().unwrap().remove(key);
         Ok(())
     }
@@ -730,12 +838,13 @@ impl Store {
     /// its digest first) and drops its manifest; deletes the packs only if every blob made it.
     /// Returns (restored, failed, bytes restored). Run it with no gateway serving the bucket.
     pub fn eject(&self, threads: usize) -> Result<(usize, usize, u64)> {
-        let mut manifests: Vec<Arc<Manifest>> = self.compacted.read().unwrap().values().cloned().collect();
-        manifests.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut blobs: Vec<(String, BlobInfo)> = self.compacted.read().unwrap().iter().map(|(k, i)| (k.clone(), *i)).collect();
+        blobs.sort_by(|a, b| a.0.cmp(&b.0));
         let (mut restored, mut failed, mut bytes) = (0, 0, 0u64);
-        for m in manifests {
+        for (key, info) in blobs {
             let tmp = std::env::temp_dir().join(format!("rift-eject-{}", std::process::id()));
             let attempt = (|| -> Result<()> {
+                let m = Manifest::decode(&self.backend.get(&manifest_key(&key, info))?.0)?;
                 let mut file = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
                 let (mut sha, mut n, mut io) = (Sha256::new(), 0u64, Ok(()));
                 self.stream(&m, 0, m.size, threads, &mut |b| {
@@ -748,25 +857,25 @@ impl Store {
                 std::io::Write::flush(&mut file)?;
                 drop(file);
                 ensure!(n == m.size && hex(&sha.finalize()) == m.sha256, "rebuild didn't match its digest");
-                match self.backend.head(&m.key)? {
+                match self.backend.head(&key)? {
                     Some((0, etag)) => {
-                        self.backend.put_file(&m.key, std::fs::File::open(&tmp)?, m.size, &[("if-match".into(), etag)])?;
+                        self.backend.put_file(&key, std::fs::File::open(&tmp)?, m.size, &[("if-match".into(), etag)])?;
                     }
                     Some((size, _)) if size == m.size => {} // the original is already there
                     _ => {}                                 // deleted: nothing to put back
                 }
-                self.backend.delete(&manifest_key(&m.key))
+                self.backend.delete(&manifest_key(&key, info))
             })();
             let _ = std::fs::remove_file(&tmp);
             match attempt {
                 Ok(()) => {
                     restored += 1;
-                    bytes += m.size;
-                    eprintln!("rift: put back {} ({:.1} MB)", m.key, m.size as f64 / 1e6);
+                    bytes += info.size;
+                    eprintln!("rift: put back {key} ({:.1} MB)", info.size as f64 / 1e6);
                 }
                 Err(e) => {
                     failed += 1;
-                    eprintln!("rift: {}: {e:#}", m.key);
+                    eprintln!("rift: {key}: {e:#}");
                 }
             }
         }
@@ -783,7 +892,7 @@ impl Store {
         use crate::metrics::{METRICS, set};
         let (blobs, bytes) = {
             let c = self.compacted.read().unwrap();
-            (c.len() as u64, c.values().map(|m| m.size).sum::<u64>())
+            (c.len() as u64, c.values().map(|i| i.size).sum::<u64>())
         };
         set(&METRICS.compacted_blobs, blobs);
         set(&METRICS.compacted_logical_bytes, bytes);
@@ -824,12 +933,20 @@ impl Store {
             }
         }
         self.forgotten.store(0, Ordering::Relaxed);
-        let manifests: Vec<Arc<Manifest>> = self.compacted.read().unwrap().values().cloned().collect();
+        let blobs: Vec<(String, BlobInfo)> = self.compacted.read().unwrap().iter().map(|(k, i)| (k.clone(), *i)).collect();
         let mut live: HashMap<u32, HashSet<u32>> = HashMap::new();
-        for m in &manifests {
-            for r in &m.refs {
+        // packs each blob uses, to find the blobs to point at moved chunks
+        let mut uses: Vec<(String, Vec<u32>)> = Vec::with_capacity(blobs.len());
+        for (key, info) in &blobs {
+            // a chunk list we can't read could hide live chunks: skip this round rather than guess
+            let refs = self.refs(key, *info).with_context(|| format!("reading the chunk list of {key}"))?;
+            let mut packs: Vec<u32> = refs.iter().map(|r| r[0]).collect();
+            packs.sort_unstable();
+            packs.dedup();
+            for r in &refs {
                 live.entry(r[0]).or_default().insert(r[1]);
             }
+            uses.push((key.clone(), packs));
         }
         let (mut dead, mut sparse) = (HashSet::new(), Vec::new());
         for (&id, (entries, _)) in &packer.packs {
@@ -875,14 +992,18 @@ impl Store {
         }
         let sparse_ids: HashSet<u32> = sparse.iter().map(|(id, _)| *id).collect();
         let mut stuck = HashSet::new();
-        for m in &manifests {
-            if !m.refs.iter().any(|r| sparse_ids.contains(&r[0])) {
+        for (key, packs) in &uses {
+            if !packs.iter().any(|p| sparse_ids.contains(p)) {
                 continue;
             }
-            let refs = m.refs.iter().map(|r| moved.get(&(r[0], r[1])).copied().unwrap_or(*r)).collect();
-            if let Err(e) = self.replace_manifest(m.with_refs(refs)) {
-                eprintln!("rift: gc: pointing {} at its moved chunks: {e:#}", m.key);
-                stuck.extend(m.refs.iter().map(|r| r[0]).filter(|id| sparse_ids.contains(id)));
+            let repointed = (|| -> Result<()> {
+                let Some(m) = self.manifest(key)? else { return Ok(()) }; // deleted meanwhile
+                let refs = m.refs.iter().map(|r| moved.get(&(r[0], r[1])).copied().unwrap_or(*r)).collect();
+                self.replace_manifest(m.with_refs(refs))
+            })();
+            if let Err(e) = repointed {
+                eprintln!("rift: gc: pointing {key} at its moved chunks: {e:#}");
+                stuck.extend(packs.iter().filter(|p| sparse_ids.contains(p)));
             }
         }
         let retire: HashSet<u32> = dead.iter().chain(sparse_ids.difference(&stuck)).copied().collect();
@@ -954,11 +1075,13 @@ impl Store {
         if !complete(&mut m, threads, &|id| fresh.get(id, &|id| self.fetch_pack(id))).context("rebuild from the store")? {
             return Ok(false);
         }
-        self.backend.put(&manifest_key(&key), m.encode(), &[])?;
+        let info = BlobInfo { size: m.size, mtime: m.mtime };
+        self.backend.put(&manifest_key(&key, info), m.encode(), &[])?;
         let size = m.size;
         {
             let _m = self.mutations.lock().unwrap();
-            self.compacted.write().unwrap().insert(key.clone(), Arc::new(m));
+            self.compacted.write().unwrap().insert(key.clone(), info);
+            self.manifests.insert(Arc::new(m));
         }
         // the stub keeps the key in listings; If-Match so a blob deleted meanwhile isn't brought back
         let stub = self.backend.put(
@@ -1039,6 +1162,28 @@ mod tests {
                 assert!(out[..] == blob[a as usize..b as usize], "range {a}..{b}");
             }
         }
+    }
+
+    #[test]
+    fn manifest_names() {
+        let info = BlobInfo { size: 1234, mtime: 99 };
+        let name = manifest_key("docker/registry/v2/blobs/sha256/ab/abc/data", info);
+        let (key, back) = parse_manifest_key(&name).unwrap();
+        assert_eq!((key.as_str(), back.size, back.mtime), ("docker/registry/v2/blobs/sha256/ab/abc/data", 1234, 99));
+        assert!(parse_manifest_key(".rift/m/docker/registry/v2/blobs/sha256/ab/abc/data").is_none());
+    }
+
+    #[test]
+    fn manifest_cache_keeps_recent() {
+        let m = |k: &str| {
+            Arc::new(Manifest::new(k.into(), 0, "0".repeat(64), 0, vec![], vec![], vec![], vec![], vec![0; 1000]))
+        };
+        let cache = ManifestCache::new(3000);
+        cache.insert(m("a"));
+        cache.insert(m("b"));
+        assert!(cache.get("a").is_some()); // a is now the most recent
+        cache.insert(m("c")); // over budget: b goes
+        assert!(cache.get("a").is_some() && cache.get("c").is_some() && cache.get("b").is_none());
     }
 
     #[test]

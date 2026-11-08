@@ -62,6 +62,13 @@ fn h(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("ASCII header")
 }
 
+/// A response with a known length always says so. tiny_http otherwise switches to chunked encoding
+/// from 32 KB up, and a chunked HEAD carries no Content-Length, which Docker refuses.
+fn sized<R: Read>(status: StatusCode, headers: Vec<Header>, body: R, len: Option<usize>) -> Response<R> {
+    let r = Response::new(status, headers, body, len, None);
+    if len.is_some() { r.with_chunked_threshold(usize::MAX) } else { r }
+}
+
 fn error(req: Request, status: u16, code: &str, message: &str) -> Result<()> {
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{code}</Code><Message>{}</Message></Error>",
@@ -197,6 +204,10 @@ impl Gateway {
     fn handle(&self, req: Request) {
         let method = req.method().as_str().to_string();
         let url = req.url().to_string();
+        if std::env::var_os("RIFT_DEBUG").is_some() {
+            let hs: Vec<String> = req.headers().iter().map(|x| format!("{}: {}", x.field, x.value)).collect();
+            eprintln!("rift: debug: {method} {url} [{}]", hs.join("; "));
+        }
         if let Err(e) = self.route(req, &method, &url) {
             eprintln!("rift: {method} {url}: {e:#}");
         }
@@ -249,8 +260,12 @@ impl Gateway {
                 if blob_digest(&key).is_some() {
                     self.reads.lock().unwrap().insert(key.clone(), unix_now());
                 }
-                match self.store.compacted(&key) {
-                    Some(m) if !self.store.is_hot(&key) => self.serve_compacted(req, method, &m, header("range")),
+                match self.store.info(&key) {
+                    Some(_) if !self.store.is_hot(&key) => match self.store.manifest(&key) {
+                        Ok(Some(m)) => self.serve_compacted(req, method, &m, header("range")),
+                        Ok(None) => self.forward(req, method, &key, &query, &headers, After::Nothing),
+                        Err(e) => error(req, 500, "InternalError", &format!("loading the manifest: {e:#}")),
+                    },
                     // stored as it is: a client following a presigned URL fetches it from the backend directly
                     _ => match &self.redirect {
                         Some(endpoint) if presigned && method == "GET" => self.redirect_to_backend(req, &key, endpoint),
@@ -318,7 +333,7 @@ impl Gateway {
         match after {
             After::RewriteList if status == 200 => {
                 let xml = resp.text()?;
-                let body = rewrite_list(&xml, &|k| self.store.compacted(k).map(|m| (m.size, m.mtime)));
+                let body = rewrite_list(&xml, &|k| self.store.info(k).map(|i| (i.size, i.mtime)));
                 let mut out = Response::from_data(body).with_status_code(200);
                 for x in back {
                     out.add_header(x);
@@ -330,7 +345,10 @@ impl Gateway {
             _ => {}
         }
         let len = resp.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse::<usize>().ok());
-        req.respond(Response::new(StatusCode(status), back, resp, len, None))?;
+        if std::env::var_os("RIFT_DEBUG").is_some() {
+            eprintln!("rift: debug: -> {status} content-length {len:?}");
+        }
+        req.respond(sized(StatusCode(status), back, resp, len))?;
         Ok(())
     }
 
@@ -352,7 +370,7 @@ impl Gateway {
         let status = StatusCode(if partial { 206 } else { 200 });
         let len = Some((end - start) as usize);
         if method == "HEAD" {
-            req.respond(Response::new(status, headers, io::empty(), len, None))?;
+            req.respond(sized(status, headers, io::empty(), len))?;
             return Ok(());
         }
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(8);
@@ -406,7 +424,7 @@ impl Gateway {
                 }
             }
         });
-        req.respond(Response::new(status, headers, ChannelReader { rx, buf: Vec::new(), at: 0 }, len, None))?;
+        req.respond(sized(status, headers, ChannelReader { rx, buf: Vec::new(), at: 0 }, len))?;
         Ok(())
     }
 
@@ -430,7 +448,11 @@ impl Gateway {
             return error(req, 400, "InvalidRequest", "copies only within the bucket");
         }
         let part = query.iter().any(|(k, _)| k == "partNumber");
-        if let Some(m) = self.store.compacted(src_key) {
+        let source_manifest = match self.store.manifest(src_key) {
+            Ok(m) => m,
+            Err(e) => return error(req, 500, "InternalError", &format!("loading the manifest: {e:#}")),
+        };
+        if let Some(m) = source_manifest {
             if part {
                 return error(req, 501, "NotImplemented", "part copy from a compacted blob");
             }
@@ -494,7 +516,7 @@ pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, s: 
                 for o in &objects {
                     stored += o.size;
                     if !o.key.starts_with(".rift/") {
-                        logical += store.compacted(&o.key).map_or(o.size, |m| m.size);
+                        logical += store.info(&o.key).map_or(o.size, |i| i.size);
                     }
                 }
                 set(&METRICS.bucket_logical_bytes, logical);
@@ -505,9 +527,9 @@ pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, s: 
                     let Some(digest) = blob_digest(&o.key) else { continue };
                     let read = reads.lock().unwrap().get(&o.key).copied().unwrap_or(0);
                     let idle = now.saturating_sub(o.modified.max(read)) >= s.cold_after;
-                    match store.compacted(&o.key) {
+                    match store.info(&o.key) {
                         // the original is back after a read: stub it again once nobody reads it
-                        Some(m) if o.size == m.size && o.size > 0 => {
+                        Some(i) if o.size == i.size && o.size > 0 => {
                             store.note_hot(&o.key, o.modified);
                             if idle {
                                 cooling.push((o.key, o.etag));
