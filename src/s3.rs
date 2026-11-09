@@ -171,6 +171,44 @@ impl Backend {
         Ok(())
     }
 
+    /// Bucket settings that cost rift its savings or put its data at risk, as log warnings.
+    pub fn settings_warnings(&self) -> Vec<String> {
+        let read = |what: &str| -> std::result::Result<Option<String>, String> {
+            match self.send("GET", "", &[(what.to_string(), String::new())], &[], Vec::new()) {
+                Ok(r) if r.status().is_success() => Ok(Some(r.text().unwrap_or_default())),
+                Ok(r) if r.status().as_u16() == 404 => Ok(None),
+                Ok(r) => Err(r.status().as_u16().to_string()),
+                Err(e) => Err(format!("{e:#}")),
+            }
+        };
+        let (mut out, mut unread) = (Vec::new(), Vec::new());
+        let lifecycle = read("lifecycle").unwrap_or_else(|e| {
+            unread.push(("lifecycle rules", "s3:GetLifecycleConfiguration", e));
+            None
+        });
+        if let Some(l) = &lifecycle {
+            out.extend(lifecycle_warnings(l));
+        }
+        match read("versioning") {
+            Ok(Some(v)) if xml_first(&v, "Status") == Some("Enabled") && !lifecycle.as_deref().is_some_and(expires_noncurrent) => out.push(
+                "versioning is on, so the originals rift replaces with stubs and the packs it deletes stay as noncurrent versions, and nothing is saved; add a lifecycle rule that expires noncurrent versions".into(),
+            ),
+            Ok(_) => {}
+            Err(e) => unread.push(("versioning", "s3:GetBucketVersioning", e)),
+        }
+        match read("object-lock") {
+            Ok(Some(o)) if xml_first(&o, "ObjectLockEnabled") == Some("Enabled") => out.push(
+                "Object Lock is on: originals rift replaces and packs it deletes are kept until their retention ends, and only then is anything saved".into(),
+            ),
+            Ok(_) => {}
+            Err(e) => unread.push(("Object Lock setting", "s3:GetBucketObjectLockConfiguration", e)),
+        }
+        for (what, permission, e) in unread {
+            out.push(format!("couldn't read the bucket's {what} ({e}); give rift {permission} to have it checked"));
+        }
+        out
+    }
+
     /// Every object under `prefix`.
     pub fn list(&self, prefix: &str) -> Result<Vec<Object>> {
         let mut out = Vec::new();
@@ -204,6 +242,42 @@ fn header(resp: &Response, name: &str) -> String {
 }
 
 /// Inner text of each `<tag>…</tag>`, in order (no nesting of the same tag).
+/// Enabled lifecycle rules that would delete or archive rift's data under `.rift/`. Rules with a
+/// tag filter are skipped: rift's objects carry no tags.
+pub fn lifecycle_warnings(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for rule in xml_all(xml, "Rule") {
+        if xml_first(rule, "Status") != Some("Enabled") || rule.contains("<Tag>") {
+            continue;
+        }
+        let prefix = xml_first(rule, "Prefix").map(xml_unescape).unwrap_or_default();
+        if !(".rift/".starts_with(&prefix) || prefix.starts_with(".rift/")) {
+            continue;
+        }
+        let id = xml_first(rule, "ID").map_or_else(|| "without an ID".to_string(), |i| format!("\"{}\"", xml_unescape(i)));
+        if xml_first(rule, "Expiration").is_some_and(|e| e.contains("<Days>") || e.contains("<Date>")) {
+            out.push(format!(
+                "lifecycle rule {id} deletes objects under .rift/, rift's packs and manifests, and the compacted blobs with them; limit it to your registry's prefix, such as docker/"
+            ));
+        }
+        for t in xml_all(rule, "Transition") {
+            if let Some(class @ ("GLACIER" | "DEEP_ARCHIVE")) = xml_first(t, "StorageClass") {
+                out.push(format!(
+                    "lifecycle rule {id} moves objects under .rift/ to {class}, where compacted blobs can't be read until restored; limit it to your registry's prefix, such as docker/"
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Whether an enabled lifecycle rule expires noncurrent versions.
+pub fn expires_noncurrent(xml: &str) -> bool {
+    xml_all(xml, "Rule")
+        .into_iter()
+        .any(|r| xml_first(r, "Status") == Some("Enabled") && !r.contains("<Tag>") && r.contains("<NoncurrentVersionExpiration>"))
+}
+
 pub fn xml_all<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
     let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
     let mut out = Vec::new();
@@ -325,6 +399,33 @@ pub fn decode_aws_chunked(body: &[u8], seed: Option<&Seed>) -> Result<(Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_rules_that_touch_rift() {
+        let rule = |id: &str, filter: &str, action: &str, status: &str| {
+            format!("<Rule><ID>{id}</ID><Filter>{filter}</Filter><Status>{status}</Status>{action}</Rule>")
+        };
+        let expire = "<Expiration><Days>30</Days></Expiration>";
+        let glacier = "<Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition>";
+        let xml = [
+            rule("all", "", expire, "Enabled"),
+            rule("registry", "<Prefix>docker/</Prefix>", expire, "Enabled"),
+            rule("packs", "<Prefix>.rift/packs/</Prefix>", glacier, "Enabled"),
+            rule("ir", "", "<Transition><Days>1</Days><StorageClass>GLACIER_IR</StorageClass></Transition>", "Enabled"),
+            rule("tagged", "<Tag><Key>k</Key><Value>v</Value></Tag>", expire, "Enabled"),
+            rule("off", "", expire, "Disabled"),
+            rule("markers", "", "<Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>", "Enabled"),
+            rule("old", "", "<NoncurrentVersionExpiration><NoncurrentDays>7</NoncurrentDays></NoncurrentVersionExpiration>", "Enabled"),
+        ]
+        .concat();
+        let w = lifecycle_warnings(&format!("<LifecycleConfiguration>{xml}</LifecycleConfiguration>"));
+        assert_eq!(w.len(), 2, "{w:#?}");
+        assert!(w[0].contains("\"all\" deletes") && w[1].contains("\"packs\" moves") && w[1].contains("GLACIER"));
+        assert!(expires_noncurrent(&xml));
+        assert!(!expires_noncurrent(&rule("a", "", expire, "Enabled")));
+        // the old form, a prefix outside any filter
+        assert_eq!(lifecycle_warnings("<Rule><Prefix></Prefix><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>").len(), 1);
+    }
 
     #[test]
     fn signs_every_header_it_sends() {

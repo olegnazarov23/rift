@@ -205,6 +205,11 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
         if client_keys.is_some() { "checked" } else { "not checked" },
         store.backend.keys_from()
     );
+    let warnings = store.backend.settings_warnings();
+    for w in &warnings {
+        eprintln!("rift: warning: {w}");
+    }
+    metrics::set(&metrics::METRICS.bucket_warnings, warnings.len() as u64);
     store.publish_totals();
     let reads = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let schedule = gateway::Schedule {

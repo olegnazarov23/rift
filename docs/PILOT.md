@@ -50,7 +50,9 @@ or add a Pod Identity association for it. The role or key needs:
 {
   "Version": "2012-10-17",
   "Statement": [
-    {"Effect": "Allow", "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+    {"Effect": "Allow",
+     "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads", "s3:GetBucketVersioning",
+                "s3:GetLifecycleConfiguration", "s3:GetBucketObjectLockConfiguration"],
      "Resource": "arn:aws:s3:::my-registry"},
     {"Effect": "Allow",
      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
@@ -176,12 +178,36 @@ network: signatures stop tampering and replays, but blob contents cross the netw
   reach rift, put a proxy or load balancer with client timeouts in front of it.
 - `/-/metrics` and `/-/healthz` answer without a signature (counts and sizes, no keys or names) on
   the same port; keep them inside too.
-- rift's own writes (packs, manifests, hot copies) carry no encryption headers, so they get the
-  bucket's default encryption. Set SSE-S3 or SSE-KMS as the bucket default. A bucket policy that
-  requires `x-amz-server-side-encryption` on every PUT will refuse rift's writes. The registry's own
-  encryption settings pass through unchanged.
+- Encryption at rest is the bucket's: see Bucket settings below.
 
-## 6. What happens next
+## 6. Bucket settings
+
+rift keeps its data in the registry's bucket, under `.rift/`, so some bucket settings change what
+it saves or put its data at risk. It checks these when it starts and logs a warning for each problem
+(`rift_bucket_setting_warnings` counts them). The three bucket reads it needs for that are in the
+policy above.
+
+- **Lifecycle rules must leave `.rift/` alone.** A rule that expires objects there deletes rift's
+  packs and manifests, and the compacted blobs with them. A rule that moves them to Glacier Flexible
+  Retrieval or Deep Archive makes compacted blobs unreadable until restored. Scope rules to your
+  registry's own prefix (`docker/` for distribution and Harbor). Standard-IA, One Zone-IA, Glacier
+  Instant Retrieval and Intelligent-Tiering without its archive tiers are fine for `.rift/`.
+- **Versioning keeps what rift removes.** With versioning on, the originals rift replaces with stubs,
+  and the packs its GC deletes, stay as noncurrent versions, so nothing is saved until they expire.
+  Add a rule that expires noncurrent versions, say after 7 days. Until they expire, those versions are
+  also a way back.
+- **Object Lock** holds those versions until their retention ends; savings show up only after that.
+- **Encryption:** rift's own writes (packs, manifests, stubs, hot copies) carry no encryption
+  headers, so they get the bucket's default encryption (SSE-S3 or SSE-KMS). With SSE-KMS, the role
+  needs `kms:GenerateDataKey` and `kms:Decrypt` on the key. A bucket policy that demands
+  `x-amz-server-side-encryption` on every PUT refuses rift's writes; use default encryption instead.
+  The registry's own encryption settings pass through unchanged.
+- **Replication** copies packs, manifests and stubs like any other object. A registry reading a
+  replica needs its own rift in front of it, since the stubs there are empty too.
+- On the gateway host, cold reads and hot copies pass through temp files (`--max-spill-gb`) holding
+  blob bytes. Put that volume on encrypted disk if your images hold anything sensitive.
+
+## 7. What happens next
 
 - **Right away:** nothing changes. rift passes every request through to the bucket.
 - **After `--cold-after` (default 7 days with no write or read):** blobs are compacted. preflate
@@ -198,7 +224,7 @@ network: signatures stop tampering and replays, but blob contents cross the netw
 - **Deletes and registry garbage collection** work as before. rift drops the deleted blobs and
   reclaims their packs after `--gc-grace` (default 10 minutes).
 
-## 7. Watching it
+## 8. Watching it
 
 - `GET /-/metrics` is Prometheus format (the chart adds scrape annotations). The ones that matter:
   - `rift_bucket_logical_bytes`, `rift_bucket_stored_bytes` and `rift_bucket_saved_ratio`: what the
@@ -210,7 +236,7 @@ network: signatures stop tampering and replays, but blob contents cross the netw
 - `GET /-/healthz` answers `{"status":"ok","compacted":N}`.
 - The log has a line for every compaction batch, garbage collection, and hot copy stubbed again.
 
-## 8. Leaving
+## 9. Leaving
 
 1. Stop rift.
 2. Run `rift eject --backend https://s3.us-east-1.amazonaws.com --bucket my-registry --yes`, with
@@ -219,7 +245,7 @@ network: signatures stop tampering and replays, but blob contents cross the netw
    fix the cause and run it again.
 3. Point the registry back at the bucket.
 
-## 9. Limits of this pilot build
+## 10. Limits of this pilot build
 
 - One rift per bucket; there's no high availability yet. While rift is down, pulls of compacted
   blobs wait for it (recent blobs are in the bucket as they were).

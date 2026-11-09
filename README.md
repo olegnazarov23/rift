@@ -93,6 +93,8 @@ an AWS role: IRSA, EKS Pod Identity, ECS task roles or EC2 instance profiles.
   checked against their signed hash, chunk signatures and checksums. `--tls-cert`/`--tls-key` serve
   HTTPS. `--max-body-mb`, `--max-requests`, `--max-cold-reads` and `--max-spill-gb` bound what one
   client can take; compaction stops unpacking deflate bombs (`--max-unpacked-mb`, 100× ratio) (details in [docs/PILOT.md](docs/PILOT.md#5-security)).
+- At start, rift checks the bucket's lifecycle rules, versioning and Object Lock, and warns about
+  settings that would delete its data or cancel the savings ([bucket settings](docs/PILOT.md#6-bucket-settings)).
 
 Running it for a pilot (Docker, Helm, registry settings, leaving): [docs/PILOT.md](docs/PILOT.md).
 Not done yet: more than one gateway per bucket.
