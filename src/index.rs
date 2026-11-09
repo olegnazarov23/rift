@@ -26,7 +26,12 @@ pub struct Index {
 impl Index {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            // only rift's user can read or swap the index (the default state dir is under /tmp)
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(dir)?;
         }
         Ok(Self { db: Database::create(path)? })
     }

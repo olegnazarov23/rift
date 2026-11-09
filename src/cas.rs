@@ -213,6 +213,17 @@ fn parallel<R: Send>(n: usize, threads: usize, f: impl Fn(usize) -> R + Sync) ->
     out.into_iter().map(|m| m.into_inner().unwrap().expect("every index ran")).collect()
 }
 
+/// Creates a file for rift's own use, readable only by rift, and never at a path that already
+/// exists: a file or symlink planted there by another local user makes this fail rather than be
+/// followed.
+pub fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
 /// What `analyze` made of a blob.
 pub enum Unpacked {
     /// the manifest, without chunk refs or group positions (`end` holds just the gzip trailer
@@ -911,7 +922,9 @@ impl Store {
             let tmp = std::env::temp_dir().join(format!("rift-eject-{}", std::process::id()));
             let attempt = (|| -> Result<()> {
                 let m = Manifest::decode(&self.backend.get(&manifest_key(&key, info))?.0)?;
-                let mut file = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+                // a leftover from an earlier run (same pid in a container); removing a symlink removes only the link
+                let _ = std::fs::remove_file(&tmp);
+                let mut file = std::io::BufWriter::new(create_private(&tmp)?);
                 let (mut sha, mut n, mut io) = (Sha256::new(), 0u64, Ok(()));
                 self.stream(&m, 0, m.size, threads, &mut |b| {
                     sha.update(b);

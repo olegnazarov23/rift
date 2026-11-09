@@ -309,7 +309,7 @@ impl Spill {
     /// The file to write to and a reader that follows it.
     fn create(path: PathBuf, reserved: Taken) -> io::Result<(Arc<Spill>, File, SpillReader)> {
         let spill = Arc::new(Spill { path, state: Mutex::default(), more: Default::default(), _reserved: reserved });
-        let writer = File::create(&spill.path)?;
+        let writer = crate::cas::create_private(&spill.path)?;
         let file = File::open(&spill.path)?;
         Ok((spill.clone(), writer, SpillReader { spill, file, at: 0 }))
     }
@@ -648,7 +648,9 @@ impl Gateway {
             return error(req, 503, "SlowDown", "too many cold reads in progress, retry");
         };
         let n = SPILL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("rift-read-{}-{n}", std::process::id()));
+        // not guessable, so another local user can't plant something at the path first
+        let nonce = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+        let path = std::env::temp_dir().join(format!("rift-read-{}-{n}-{nonce:08x}", std::process::id()));
         let (sink, reader): (Sink, Box<dyn Read + Send>) = match Spill::create(path, reserved) {
             Ok((spill, file, reader)) => (Sink::File(spill, file), Box::new(reader)),
             Err(e) => {
@@ -994,6 +996,26 @@ mod tests {
         drop(reader);
         assert!(!path.exists(), "the temp file goes once both sides are done");
         assert!(budget.take(1 << 20, Duration::ZERO).is_some(), "and its bytes go back to the budget");
+    }
+
+    #[test]
+    fn private_files_refuse_planted_paths() {
+        let dir = std::env::temp_dir().join(format!("rift-private-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (target, planted) = (dir.join("victim"), dir.join("planted"));
+        std::fs::write(&target, b"keep me").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &planted).unwrap();
+        assert!(crate::cas::create_private(&planted).is_err(), "a symlink at the path isn't followed");
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+        let fresh = dir.join("fresh");
+        crate::cas::create_private(&fresh).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
