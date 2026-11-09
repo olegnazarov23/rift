@@ -1,5 +1,6 @@
+// Changed for rift: re-exports DRAIN_LIMIT; see vendor/tiny_http/README.md.
 pub use self::custom_stream::CustomStream;
-pub use self::equal_reader::EqualReader;
+pub use self::equal_reader::{EqualReader, DRAIN_LIMIT, DRAIN_TIME};
 pub use self::fused_reader::FusedReader;
 pub use self::messages_queue::MessagesQueue;
 pub use self::refined_tcp_stream::RefinedTcpStream;

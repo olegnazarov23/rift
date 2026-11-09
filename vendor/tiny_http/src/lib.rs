@@ -1,5 +1,5 @@
-// Changed for rift: Limits and Server::from_listener_with_limits, and the accept loop keeps going
-// after errors; see vendor/tiny_http/README.md.
+// Changed for rift: Limits and Server::from_listener_with_limits, a deadline watchdog, one request
+// at a time per connection, and the accept loop keeps going after errors; see vendor/tiny_http/README.md.
 //! # Simple usage
 //!
 //! ## Creating the server
@@ -187,6 +187,45 @@ pub struct Limits {
     pub max_connections: Option<usize>,
 }
 
+/// Header deadlines, enforced by closing the socket: that wakes whatever read is blocked on it,
+/// a TLS handshake included, which a check between reads can't reach.
+#[derive(Default)]
+struct Deadlines {
+    conns: std::sync::Mutex<std::collections::HashMap<u64, (Option<std::time::Instant>, Connection)>>,
+}
+
+impl Deadlines {
+    fn sweep(&self) {
+        let now = std::time::Instant::now();
+        for (at, conn) in self.conns.lock().unwrap().values_mut() {
+            if at.is_some_and(|t| t <= now) {
+                let _ = conn.shutdown(std::net::Shutdown::Both);
+                *at = None;
+            }
+        }
+    }
+}
+
+/// A connection's entry in `Deadlines`, removed when dropped.
+pub(crate) struct Watch {
+    deadlines: Arc<Deadlines>,
+    id: u64,
+}
+
+impl Watch {
+    pub(crate) fn set(&self, at: Option<std::time::Instant>) {
+        if let Some(entry) = self.deadlines.conns.lock().unwrap().get_mut(&self.id) {
+            entry.0 = at;
+        }
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.deadlines.conns.lock().unwrap().remove(&self.id);
+    }
+}
+
 /// Counts a connection as live until dropped.
 struct LiveConnection(Arc<std::sync::atomic::AtomicUsize>);
 
@@ -326,6 +365,17 @@ impl Server {
             let tasks_pool = util::TaskPool::new();
             let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut last_warning: Option<std::time::Instant> = None;
+            let deadlines = Arc::new(Deadlines::default());
+            let mut next_id = 0u64;
+            if limits.header_timeout.is_some() {
+                let (deadlines, close) = (deadlines.clone(), inside_close_trigger.clone());
+                thread::spawn(move || {
+                    while !close.load(Relaxed) {
+                        thread::sleep(std::time::Duration::from_millis(200));
+                        deadlines.sweep();
+                    }
+                });
+            }
 
             log::debug!("Running accept thread");
             while !inside_close_trigger.load(Relaxed) {
@@ -338,6 +388,16 @@ impl Server {
                         if sock.set_timeouts(limits.idle_timeout).is_err() {
                             continue;
                         }
+                        // the first request's deadline runs from now, so it covers the TLS handshake
+                        let watch = match (limits.header_timeout, sock.try_clone()) {
+                            (Some(t), Ok(handle)) => {
+                                next_id += 1;
+                                let at = Some(std::time::Instant::now() + t);
+                                deadlines.conns.lock().unwrap().insert(next_id, (at, handle));
+                                Some(Watch { deadlines: deadlines.clone(), id: next_id })
+                            }
+                            _ => None,
+                        };
                         let (read_closable, write_closable) = match ssl {
                             None => RefinedTcpStream::new(sock),
                             #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
@@ -355,7 +415,7 @@ impl Server {
                             Some(ref _ssl) => unreachable!(),
                         };
 
-                        Ok(ClientConnection::new(write_closable, read_closable, limits))
+                        Ok(ClientConnection::new(write_closable, read_closable, limits, watch))
                     }
                     Err(e) => Err(e),
                 };
@@ -369,16 +429,14 @@ impl Server {
                         tasks_pool.spawn(Box::new(move || {
                             let _connection = connection.take();
                             if let Some(client) = client.take() {
-                                // Synchronization is needed for HTTPS requests to avoid a deadlock
-                                if client.secure() {
-                                    let (sender, receiver) = mpsc::channel();
-                                    for rq in client {
-                                        messages.push(rq.with_notify_sender(sender.clone()).into());
-                                        receiver.recv().unwrap();
-                                    }
-                                } else {
-                                    for rq in client {
-                                        messages.push(rq.into());
+                                // one request at a time on every connection (upstream did this only
+                                // for HTTPS): a pipelining client that never reads its responses
+                                // could otherwise queue requests without limit
+                                let (sender, receiver) = mpsc::channel();
+                                for rq in client {
+                                    messages.push(rq.with_notify_sender(sender.clone()).into());
+                                    if receiver.recv().is_err() {
+                                        break;
                                     }
                                 }
                             }

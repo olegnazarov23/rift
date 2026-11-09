@@ -1,4 +1,5 @@
-// Changed for rift: a deadline and size limits for request headers; see vendor/tiny_http/README.md.
+// Changed for rift: a deadline and size limits for request headers, and connections closed when a
+// body couldn't be drained; see vendor/tiny_http/README.md.
 use ascii::AsciiString;
 
 use std::io::Error as IoError;
@@ -11,7 +12,9 @@ use std::str::FromStr;
 use crate::common::{HTTPVersion, Method};
 use crate::util::RefinedTcpStream;
 use crate::util::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder};
-use crate::{Limits, Request};
+use crate::{Limits, Request, Watch};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// A ClientConnection is an object that will store a socket to a client
@@ -38,6 +41,14 @@ pub struct ClientConnection {
     secure: bool,
 
     limits: Limits,
+
+    // closes the socket if a request's headers miss their deadline (armed at accept for the first)
+    watch: Option<Watch>,
+    armed: bool,
+
+    // set when a request's body couldn't be read through: the stream is out of step, so the
+    // connection takes no more requests
+    poisoned: Arc<AtomicBool>,
 }
 
 /// Error that can happen when reading a request.
@@ -56,6 +67,7 @@ impl ClientConnection {
         write_socket: RefinedTcpStream,
         mut read_socket: RefinedTcpStream,
         limits: Limits,
+        watch: Option<Watch>,
     ) -> ClientConnection {
         let remote_addr = read_socket.peer_addr();
         let secure = read_socket.secure();
@@ -71,6 +83,9 @@ impl ClientConnection {
             no_more_requests: false,
             secure,
             limits,
+            armed: watch.is_some(),
+            watch,
+            poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -98,6 +113,16 @@ impl ClientConnection {
                 None => return Err(IoError::new(ErrorKind::ConnectionAborted, "Unexpected EOF")),
             };
 
+            // the previous request was dropped (or this read couldn't start): is the stream in step?
+            if self.poisoned.load(Ordering::SeqCst) {
+                return Err(IoError::new(ErrorKind::ConnectionAborted, "a request body wasn't read through"));
+            }
+            if started.is_none() && !self.armed {
+                if let (Some(watch), Some(t)) = (&self.watch, self.limits.header_timeout) {
+                    watch.set(Some(Instant::now() + t));
+                    self.armed = true;
+                }
+            }
             let started = *started.get_or_insert_with(Instant::now);
             if self.limits.header_timeout.is_some_and(|t| started.elapsed() > t) {
                 return Err(IoError::new(ErrorKind::TimedOut, "request headers took too long"));
@@ -175,6 +200,7 @@ impl ClientConnection {
             *self.remote_addr.as_ref().unwrap(),
             data_source,
             writer,
+            self.poisoned.clone(),
         )
         .map_err(|e| {
             use crate::request;
@@ -185,6 +211,12 @@ impl ClientConnection {
                 }
             }
         })?;
+
+        // the headers and any small body are in: the idle timeout governs from here
+        if let Some(watch) = &self.watch {
+            watch.set(None);
+            self.armed = false;
+        }
 
         // return the request
         Ok(request)

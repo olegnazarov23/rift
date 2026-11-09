@@ -1,7 +1,17 @@
+// Changed for rift: bounded drain on drop; see vendor/tiny_http/README.md.
 use std::io::Read;
 use std::io::Result as IoResult;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
+
+/// The most of an unread request body that's read and thrown away when the request is dropped.
+/// A bigger rest means the connection can't be reused (the next request would start mid-body), so
+/// it's marked to be closed instead.
+pub const DRAIN_LIMIT: usize = 64 * 1024;
+/// ...and for at most this long, so a client dripping its body can't hold the connection.
+pub const DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A `Reader` that reads exactly the number of bytes from a sub-reader.
 ///
@@ -15,6 +25,7 @@ where
     reader: R,
     size: usize,
     last_read_signal: Sender<IoResult<()>>,
+    poison: Option<Arc<AtomicBool>>,
 }
 
 impl<R> EqualReader<R>
@@ -28,9 +39,22 @@ where
             reader,
             size,
             last_read_signal: tx,
+            poison: None,
         };
 
         (r, rx)
+    }
+
+    /// Sets `flag` if the body can't be drained when dropped.
+    pub fn poison_on_drop(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.poison = Some(flag);
+        self
+    }
+
+    fn poison(&self) {
+        if let Some(flag) = &self.poison {
+            flag.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -64,22 +88,30 @@ where
     R: Read,
 {
     fn drop(&mut self) {
-        let mut remaining_to_read = self.size;
-
-        while remaining_to_read > 0 {
-            let mut buf = vec![0; remaining_to_read];
-
-            match self.reader.read(&mut buf) {
+        // upstream allocated the whole remaining length at once: a request claiming a huge
+        // Content-Length aborted the process
+        let mut buf = [0u8; 8192];
+        let (mut budget, started) = (DRAIN_LIMIT, std::time::Instant::now());
+        while self.size > 0 {
+            if budget == 0 || started.elapsed() > DRAIN_TIME {
+                self.poison();
+                return;
+            }
+            let want = buf.len().min(self.size).min(budget);
+            match self.reader.read(&mut buf[..want]) {
                 Err(e) => {
                     self.last_read_signal.send(Err(e)).ok();
-                    break;
+                    self.poison();
+                    return;
                 }
                 Ok(0) => {
                     self.last_read_signal.send(Ok(())).ok();
-                    break;
+                    self.poison();
+                    return;
                 }
-                Ok(other) => {
-                    remaining_to_read -= other;
+                Ok(n) => {
+                    self.size -= n;
+                    budget -= n;
                 }
             }
         }

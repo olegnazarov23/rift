@@ -398,7 +398,12 @@ impl Gateway {
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for req in server.incoming_requests() {
             if active.load(std::sync::atomic::Ordering::Relaxed) >= self.max_requests {
-                let _ = error(req, 503, "SlowDown", "too many requests in flight, retry");
+                // answered off this thread: a client that doesn't read its response would stall
+                // every request behind it (a connection carries one request at a time, so this is
+                // bounded by --max-connections)
+                thread::spawn(move || {
+                    let _ = error(req, 503, "SlowDown", "too many requests in flight, retry");
+                });
                 continue;
             }
             active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

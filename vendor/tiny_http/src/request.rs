@@ -1,3 +1,5 @@
+// Changed for rift: unread bodies are drained within a limit or the connection is closed; see
+// vendor/tiny_http/README.md.
 use std::io::Error as IoError;
 use std::io::{self, Cursor, ErrorKind, Read, Write};
 
@@ -5,9 +7,11 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
-use crate::util::{EqualReader, FusedReader};
+use crate::util::{EqualReader, FusedReader, DRAIN_LIMIT, DRAIN_TIME};
 use crate::{HTTPVersion, Header, Method, Response, StatusCode};
 use chunked_transfer::Decoder;
 
@@ -100,6 +104,42 @@ impl<R> Drop for NotifyOnDrop<R> {
     }
 }
 
+/// A chunked body: what's left unread when it's dropped is read and thrown away within a limit;
+/// past that, or on a malformed body, the connection is marked to be closed. Upstream left it
+/// unread, so the rest was parsed as the next request.
+struct DrainOnDrop<R: Read> {
+    inner: R,
+    poison: Arc<AtomicBool>,
+    done: bool,
+}
+
+impl<R: Read> Read for DrainOnDrop<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 && !buf.is_empty() {
+            self.done = true;
+        }
+        Ok(n)
+    }
+}
+
+impl<R: Read> Drop for DrainOnDrop<R> {
+    fn drop(&mut self) {
+        let mut buf = [0u8; 8192];
+        let (mut budget, started) = (DRAIN_LIMIT, std::time::Instant::now());
+        while !self.done {
+            match self.inner.read(&mut buf) {
+                Ok(0) => self.done = true,
+                Ok(n) if n < budget && started.elapsed() <= DRAIN_TIME => budget -= n,
+                _ => {
+                    self.poison.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Error that can happen when building a `Request` object.
 #[derive(Debug)]
 pub enum RequestCreationError {
@@ -135,6 +175,7 @@ pub fn new_request<R, W>(
     remote_addr: Option<SocketAddr>,
     mut source_data: R,
     writer: W,
+    poison: Arc<AtomicBool>,
 ) -> Result<Request, RequestCreationError>
 where
     R: Read + Send + 'static,
@@ -213,12 +254,13 @@ where
             Box::new(Cursor::new(buffer)) as Box<dyn Read + Send + 'static>
         } else {
             let (data_reader, _) = EqualReader::new(source_data, content_length); // TODO:
-            Box::new(FusedReader::new(data_reader)) as Box<dyn Read + Send + 'static>
+            Box::new(FusedReader::new(data_reader.poison_on_drop(poison))) as Box<dyn Read + Send + 'static>
         }
     } else if transfer_encoding.is_some() {
         // if a transfer-encoding was specified, then "chunked" is ALWAYS applied
         // over the message (RFC2616 #3.6)
-        Box::new(FusedReader::new(Decoder::new(source_data))) as Box<dyn Read + Send + 'static>
+        Box::new(FusedReader::new(DrainOnDrop { inner: Decoder::new(source_data), poison, done: false }))
+            as Box<dyn Read + Send + 'static>
     } else {
         // if we have neither a Content-Length nor a Transfer-Encoding,
         // assuming that we have no data

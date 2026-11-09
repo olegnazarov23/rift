@@ -15,5 +15,15 @@ depends on unmaintained crates (ring 0.16, rustls-pemfile 0.2). Changes for rift
   connects and stalls, or sends an endless header, holds a thread or memory for good.
 - The accept loop waits and retries after an error (out of file descriptors, say) instead of
   stopping, which ended the server for good.
+- A watchdog thread closes a connection whose request headers miss their deadline
+  (`src/lib.rs`): a socket timeout restarts with every byte, so a client sending one byte at a
+  time, or stalling a TLS handshake, was never cut off.
+- Every connection serves one request at a time (upstream did this only for HTTPS), so a client
+  that pipelines requests and never reads the responses can't queue them without limit.
+- A request body left unread when its request is dropped is read and thrown away up to 64 KiB
+  and for at most a second; past that, or if it's malformed, the connection is closed
+  (`src/util/equal_reader.rs`, `src/request.rs`, `src/client.rs`). Upstream allocated the whole
+  remaining length at once, so a request claiming a huge `Content-Length` aborted the process, and
+  left the rest of a chunked body to be parsed as the next request.
 
 Changed files say so in their first line.
