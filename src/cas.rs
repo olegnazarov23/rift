@@ -1365,11 +1365,38 @@ impl Store {
         let now = unix_now();
         let mut guard = self.packer.lock().unwrap();
         let packer = guard.as_mut().context("not the compactor")?;
+        self.forgotten.store(0, Ordering::Relaxed);
+        // what's live is every manifest in the bucket, an old one of a blob compacted twice
+        // included: serving drops catalog entries this gateway can't use, which must never make
+        // their chunks look unused
+        let blobs: Vec<(String, BlobInfo)> = self.backend.list(MANIFESTS)?.iter().filter_map(|o| parse_manifest_key(&o.key)).collect();
+        // pass 1: bytes each pack serves (a chunk several blobs use counts several times, which only
+        // ever overstates what's live) and the packs each blob uses
+        let mut served: HashMap<u32, u64> = HashMap::new();
+        let mut uses: Vec<(String, BlobInfo, Vec<u32>)> = Vec::with_capacity(blobs.len());
+        for (key, info) in &blobs {
+            let Some(refs) = self.live_refs(key, *info)? else { continue };
+            for r in &refs {
+                *served.entry(r[0]).or_default() += u64::from(r[2]);
+            }
+            let mut packs: Vec<u32> = refs.iter().map(|r| r[0]).collect();
+            packs.sort_unstable();
+            packs.dedup();
+            uses.push((key.clone(), *info, packs));
+        }
+        // retired packs whose grace is over go, but only if no manifest uses them: whatever
+        // pointed a blob at a pack after it was retired, the pack stays
         {
             let mut retired = self.retired.lock().unwrap();
             let (due, waiting): (Vec<_>, Vec<_>) = retired.drain(..).partition(|r| r.1 + grace <= now);
             *retired = waiting;
             for (id, when, size) in due {
+                if served.contains_key(&id) {
+                    eprintln!("rift: gc: pack {id} was retired but a blob uses it again; kept");
+                    let chunks = Self::read_idx(&self.backend, id).map_or(0, |e| e.iter().map(|x| u64::from(x.2)).sum());
+                    packer.packs.insert(id, (size, chunks));
+                    continue;
+                }
                 // another compactor may have taken over and started using the pack
                 if !go() {
                     retired.push((id, when, size));
@@ -1386,24 +1413,6 @@ impl Store {
                     }
                 }
             }
-        }
-        self.forgotten.store(0, Ordering::Relaxed);
-        // what's live is every manifest in the bucket: serving drops catalog entries this gateway
-        // can't use, which must never make their chunks look unused
-        let blobs: Vec<(String, BlobInfo)> = manifest_names(&self.backend.list(MANIFESTS)?).into_iter().collect();
-        // pass 1: bytes each pack serves (a chunk several blobs use counts several times, which only
-        // ever overstates what's live) and the packs each blob uses
-        let mut served: HashMap<u32, u64> = HashMap::new();
-        let mut uses: Vec<(String, BlobInfo, Vec<u32>)> = Vec::with_capacity(blobs.len());
-        for (key, info) in &blobs {
-            let Some(refs) = self.live_refs(key, *info)? else { continue };
-            for r in &refs {
-                *served.entry(r[0]).or_default() += u64::from(r[2]);
-            }
-            let mut packs: Vec<u32> = refs.iter().map(|r| r[0]).collect();
-            packs.sort_unstable();
-            packs.dedup();
-            uses.push((key.clone(), *info, packs));
         }
         let (mut dead, mut sparse) = (HashSet::new(), HashSet::new());
         for (&id, &(_, total)) in &packer.packs {
@@ -1429,9 +1438,11 @@ impl Store {
             }
         }
         ensure!(go(), "no longer the compactor");
-        // copy the live chunks of sparse packs; dedup mustn't point into them meanwhile
+        // copy the live chunks of sparse packs. Dedup mustn't point them into a pack this run
+        // retires: a sparse one, or a dead one that holds a copy of the same chunk (two packs can,
+        // and after an index rebuild either copy may be the indexed one)
         let mut moved: HashMap<(u32, u32), Ref> = HashMap::new();
-        packer.exclude = sparse.clone();
+        packer.exclude = sparse.union(&dead).copied().collect();
         let copied = (|| -> Result<()> {
             for &id in &sparse {
                 let entries = Self::read_idx(&self.backend, id)?;
