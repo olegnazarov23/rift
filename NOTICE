@@ -5,3 +5,7 @@ This product includes preflate-rs (https://github.com/microsoft/preflate-rs),
 Copyright (c) Microsoft Corporation, licensed under the Apache License 2.0.
 A modified copy is vendored in vendor/preflate-rs; vendor/preflate-rs/README.md
 lists the changes, and each changed file says so in its first line.
+
+This product includes tiny_http (https://github.com/tiny-http/tiny-http), licensed under the
+MIT license or the Apache License 2.0. A modified copy is vendored in vendor/tiny_http;
+vendor/tiny_http/README.md lists the changes.

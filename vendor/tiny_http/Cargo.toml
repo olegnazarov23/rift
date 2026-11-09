@@ -1,0 +1,38 @@
+[package]
+edition = "2018"
+name = "tiny_http"
+version = "0.12.0"
+authors = [
+    "pierre.krieger1708@gmail.com",
+    "Corey Farwell <coreyf@rwell.org>",
+]
+description = "tiny_http 0.12.0 with its rustls support moved to rustls 0.23 (vendored for rift)"
+keywords = [
+    "http",
+    "server",
+    "web",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tiny-http/tiny-http"
+
+publish = false
+
+[dependencies]
+ascii = "1.0"
+chunked_transfer = "1"
+httpdate = "1.0.2"
+log = "0.4.4"
+rustls = { version = "0.23.46", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1.15", optional = true, features = ["std"] }
+zeroize = { version = "1", optional = true }
+
+[features]
+default = []
+ssl-rustls = ["rustls", "rustls-pki-types", "zeroize"]
+# dropped for rift, which uses ssl-rustls; declared so the source's cfg lines stay valid
+ssl-openssl = []
+
+# upstream code the newer compiler flags; left as it was
+[lints.rust]
+unused_imports = "allow"
+dead_code = "allow"

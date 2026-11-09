@@ -988,6 +988,24 @@ mod tests {
     }
 
     #[test]
+    fn serves_https() {
+        let rcgen::CertifiedKey { cert, key_pair } = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let ssl = |key: Vec<u8>| tiny_http::SslConfig { certificate: cert.pem().into_bytes(), private_key: key };
+        assert!(Server::https("127.0.0.1:0", ssl(b"not a key".to_vec())).is_err(), "a bad key is an error, not a panic");
+        let server = Server::https("127.0.0.1:0", ssl(key_pair.serialize_pem().into_bytes())).unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let answer = thread::spawn(move || server.recv().unwrap().respond(Response::from_string("ok")).unwrap());
+        let client = reqwest::blocking::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(cert.pem().as_bytes()).unwrap())
+            .resolve("localhost", addr)
+            .build()
+            .unwrap();
+        let body = client.get(format!("https://localhost:{}/", addr.port())).send().unwrap().text().unwrap();
+        assert_eq!(body, "ok");
+        answer.join().unwrap();
+    }
+
+    #[test]
     fn redacts_signatures() {
         assert_eq!(redact("Credential=AK/x, SignedHeaders=host, Signature=abc123"), "Credential=AK/x, SignedHeaders=host, Signature=…");
         assert_eq!(redact("/b/k?X-Amz-Date=1&X-Amz-Signature=deadbeef&x=1"), "/b/k?X-Amz-Date=1&X-Amz-Signature=…&x=1");
