@@ -226,8 +226,11 @@ pub fn parse_amz_date(s: &str) -> Option<u64> {
     Some(days as u64 * 86_400 + u64::from(n(9, 11)? * 3600 + n(11, 13)? * 60 + n(13, 15)?))
 }
 
-/// Checks a presigned URL (signature in the query string) against our credentials, and that it
-/// hasn't expired.
+/// The longest a presigned URL may be valid, as S3 allows: 7 days.
+pub const MAX_EXPIRES: u64 = 7 * 24 * 3600;
+
+/// Checks a presigned URL (signature in the query string) against our credentials, and that it's
+/// valid now: signed no later than 15 minutes from now, for at most 7 days, and not expired.
 pub fn verify_presigned(
     access_key: &str,
     secret: &str,
@@ -252,8 +255,9 @@ pub fn verify_presigned(
     if scope.len() != 5 || scope[0] != access_key || !date.starts_with(scope[1]) {
         return false;
     }
+    let now = unix_now();
     match (parse_amz_date(date), expires.parse::<u64>()) {
-        (Some(t), Ok(e)) if unix_now() <= t + e => {}
+        (Some(t), Ok(e)) if e <= MAX_EXPIRES && t <= now + MAX_SKEW && now <= t.saturating_add(e) => {}
         _ => return false,
     }
     let unsigned: Vec<(String, String)> = params.iter().filter(|(k, _)| k != "X-Amz-Signature").cloned().collect();
@@ -374,6 +378,23 @@ mod tests {
         assert!(verify_presigned("AK", "SK", "GET", "/b/k", &raw, &host));
         assert!(!verify_presigned("AK", "other", "GET", "/b/k", &raw, &host));
         assert!(!verify_presigned("AK", "SK", "GET", "/b/other", &raw, &host));
+        // validly signed, but for longer than S3 allows, or dated well into the future
+        let signed = |date: &str, expires: &str| {
+            let mut p = vec![
+                ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+                ("X-Amz-Credential".to_string(), format!("AK/{}/us-east-1/s3/aws4_request", &date[..8])),
+                ("X-Amz-Date".to_string(), date.to_string()),
+                ("X-Amz-Expires".to_string(), expires.to_string()),
+                ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
+            ];
+            let (sig, _) = sign("SK", "us-east-1", date, "GET", "/b/k", &canonical_query(&p), &[("host", "h:1")], "UNSIGNED-PAYLOAD");
+            p.push(("X-Amz-Signature".to_string(), sig));
+            canonical_query(&p)
+        };
+        assert!(verify_presigned("AK", "SK", "GET", "/b/k", &signed(&date, "604800"), &host));
+        assert!(!verify_presigned("AK", "SK", "GET", "/b/k", &signed(&date, "604801"), &host), "over 7 days");
+        let ahead = amz_date(unix_now() + 3600);
+        assert!(!verify_presigned("AK", "SK", "GET", "/b/k", &signed(&ahead, "600"), &host), "signed an hour from now");
     }
 
     #[test]
