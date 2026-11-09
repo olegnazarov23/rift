@@ -70,10 +70,18 @@ With Helm:
       --set backend.endpoint=https://s3.us-east-1.amazonaws.com \
       --set backend.bucket=my-registry --set credentials.existingSecret=rift-keys
 
+The chart runs two gateways that only serve, behind the Service, and one compactor
+([High availability](HA.md)): losing a serving gateway, or a rolling update, doesn't interrupt the
+registry. `--set serve.replicas=0` runs the compactor alone, serving too.
+
 With Docker:
 
     docker run -d --name rift -p 9100:9100 --env-file rift.env ghcr.io/olegnazarov23/rift:0.1.4 \
       gateway --listen 0.0.0.0:9100 --backend https://s3.us-east-1.amazonaws.com --bucket my-registry
+
+More gateways for the same bucket take `--serve-only` (they need no state dir) and go behind one
+load balancer; the one without it compacts. Only one gateway compacts at a time: a second one
+without `--serve-only` stands by and takes over if the first stops for two minutes.
 
 ## 4. Point the registry at rift
 
@@ -252,6 +260,8 @@ policy above.
   - `rift_cold_reads_total`, `rift_cold_read_seconds_total`, `rift_hot_copies_made_total`,
     `rift_redirects_total`: how pulls are served.
   - `rift_backend_errors_total`, `rift_cold_read_errors_total`: should stay at zero.
+  - `rift_compactor`: 1 on the gateway compacting the bucket. The bucket and pack gauges come from
+    it; alert if no gateway reports 1 for a while.
 - `GET /-/healthz` answers `{"status":"ok","compacted":N}`.
 - `--access-log` writes a JSON line per request to stdout: time, client address (and
   `X-Forwarded-For`), the access key id the request was signed with, method, path with signatures
@@ -271,8 +281,8 @@ policy above.
 
 ## 10. Limits of this pilot build
 
-- One rift per bucket; there's no high availability yet ([design proposal](HA.md)). While rift is down, pulls of compacted
-  blobs wait for it (recent blobs are in the bucket as they were).
+- One compactor per bucket at a time. If it's down, serving goes on but compaction and GC wait;
+  a standby compactor takes over after two minutes ([High availability](HA.md)).
 - Compaction runs at about 0.5 MB/s per core. A large registry takes a while to backfill; new
   pushes are a small daily stream.
 - A cold pull of a big layer on few cores is slower than a plain download, about 2–3× on 6 cores.

@@ -98,8 +98,11 @@ an AWS role: IRSA, EKS Pod Identity, ECS task roles or EC2 instance profiles.
 - At start, rift checks the bucket's lifecycle rules, versioning and Object Lock, and warns about
   settings that would delete its data or cancel the savings ([bucket settings](docs/PILOT.md#6-bucket-settings)).
 
+- Several gateways can serve one bucket (`--serve-only`) while one compacts it; the chart runs two
+  serving and one compacting, so losing a gateway doesn't interrupt the registry
+  ([high availability](docs/HA.md)).
+
 Running it for a pilot (Docker, Helm, registry settings, leaving): [docs/PILOT.md](docs/PILOT.md).
-Not done yet: more than one gateway per bucket.
 
 Tested locally against distribution 2.8.3 and MinIO with 3 redis and 3 postgres images (69 blobs,
 577.7 MB). The bucket held 238.6 MB, 58.7% less. Every blob read back through the registry was

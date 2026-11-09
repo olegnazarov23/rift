@@ -1,64 +1,110 @@
-# High availability: design proposal
+# High availability
 
-Status: proposal, not built. Today rift runs as one gateway per bucket (the chart uses
-`replicas: 1` and the `Recreate` strategy). While that gateway is down, pulls of compacted blobs
-fail and the registry can't write through it.
+From 0.1.5, several gateways can serve one bucket while one of them compacts it. The Helm chart
+runs two serving gateways behind the Service and one compactor. A serving gateway can go at any
+time (a crash, a node, a rolling update) without interrupting pushes or pulls. If the compactor
+goes, compaction pauses until it's back, or until a standby takes over.
 
-## Why two gateways on one bucket aren't safe today
+## Roles
 
-- **Pack numbers.** Each gateway picks the next pack number from what it saw at start. Two
-  compactors can pick the same number and overwrite each other's pack: data loss.
-- **Stale catalogs.** A gateway learns which blobs are compacted when it starts. A blob another
-  gateway compacted later looks like an ordinary object, so its empty stub would be served as the
-  blob, and listings would show it as 0 bytes.
-- **Garbage collection.** Two collectors with different views could delete a pack the other just
-  started using.
+- **Serving gateways** (`--serve-only`) answer the registry: pass-through, cold reads, hot copies,
+  redirects. They keep no state on disk and never write packs; they delete a blob's manifest only
+  when the registry deletes or replaces that blob through them.
+- **The compactor** (a gateway without `--serve-only`) also lists the bucket, compacts cold blobs,
+  stubs idle hot copies again and collects garbage. It keeps the chunk index in `--state-dir`.
 
-## Phase 1: several gateways serve, one compacts (about 2 days)
+## How serving gateways stay right
 
-Serving (pass-through, cold reads, hot copies) is what pulls and pushes depend on; compaction and GC
-are background work that can pause for a while without harm. So:
+A gateway can't rely on what it remembers, because another gateway may have compacted, cooled or
+deleted a blob a moment ago. So for blobs the bucket decides:
 
-1. **One compactor.** A new `--compactor` flag (default on) decides whether a gateway compacts, cools
-   hot copies and runs GC. The chart runs N serving replicas plus one compacting one.
-2. **Stub-aware reads.** A stub carries `x-amz-meta-rift-size` (and will carry the blob's date too). Any
-   gateway that reads a stub it doesn't know loads the blob's manifest and serves the rebuild, so
-   no gateway can ever hand out a stub as content. This also guards the single-gateway case.
-3. **Catalog updates.** After each batch, the compactor writes a small journal object under
-   `.rift/journal/` listing the blobs it compacted, cooled or dropped. Serving gateways read new
-   journal entries every few seconds, a single cheap LIST, and update their catalog, so listings
-   stay right.
-4. **Create-only writes.** Packs, indexes and manifests are written with `If-None-Match: *` (S3 and
-   MinIO support it), so even a misconfigured second compactor fails loudly instead of overwriting.
-   Stubs and hot copies already use `If-Match`.
-5. **Chart.** `replicas` defaults to 2 serving gateways plus the compactor, with a
-   PodDisruptionBudget and rolling updates, all behind one Service.
+- **Reads go by what the bucket holds.** A GET or HEAD of a blob goes to the bucket. If the answer
+  is a stub (an empty object carrying `x-amz-meta-rift-size`, and from 0.1.5 the blob's date), the
+  gateway loads the blob's manifest and serves the rebuild. A stub is never served as the blob,
+  and a blob deleted through another gateway isn't reported as present.
+- **Redirects check first.** With `--redirect-endpoint`, a gateway checks the object (a HEAD)
+  before redirecting a client to the bucket, so no client is sent to a stub.
+- **Listings.** A listing shows an empty object at a blob's key for a blob compacted through
+  another gateway; the gateway looks up its manifest by name and lists the original size.
+- **Copies** of a blob are rebuilt when the bucket holds its stub.
+- **Cached manifests** are checked against the bucket once they're 30 seconds old, because GC may
+  have pointed them at new packs. Old packs stay readable for `--gc-grace`, so keep that at two
+  minutes or more (the default is 10).
+- **The catalog** (which blobs are compacted, for listings) is read again every `--interval`.
 
-Result: losing any gateway, including the compactor, doesn't interrupt pushes or pulls. Losing the
-compactor pauses compaction until it's back.
+## One compactor at a time
 
-## Phase 2: the compactor fails over by itself (about 3 days)
+Two compactors on one bucket would overwrite each other's packs and collect chunks the other just
+started using. Every gateway that may compact takes turns holding `.rift/compactor`:
 
-1. **Lease.** Gateways that may compact compete for a lease object (`.rift/lease`), taken with
-   `If-None-Match: *` and renewed with `If-Match` every 10 seconds. A lease not renewed for 60 seconds
-   can be taken over. The lease carries an epoch number that increases with every takeover.
-2. **Fencing destructive steps.** Before any GC delete, the holder re-reads the lease and stops if
-   the epoch moved. Deletes happen in short batches, each well inside the lease time. Packs are
-   retired first (written down under `.rift/retired/`, so every compactor stops deduplicating into
-   them) and deleted only after the grace period, by whichever gateway holds the lease then, after
-   it checks again that nothing refers to them.
-3. **Index hand-over.** A new holder brings its local chunk index up to date from the packs' `.idx`
-   files before compacting (this already happens at start).
+- The holder rewrites the object every 20 seconds, always with `If-Match` on its last version.
+- Another gateway takes it over only after seeing it unchanged for two minutes, again with a
+  conditional write, so two can't take it at once. It then brings its chunk index up to date with
+  the packs in the bucket before it compacts.
+- A holder that couldn't renew for a minute stops compacting and collecting, a minute before
+  anyone may take over. It checks before each blob it compacts, each manifest GC changes, and each
+  pack it deletes.
+- A compactor that restarts (same state dir) takes its lock back at once.
+- Packs, pack indexes and manifests are written with `If-None-Match: *`, so a second compactor
+  would fail rather than overwrite.
 
-## Testing
+At start, rift checks that the bucket refuses a write whose `If-None-Match` fails (AWS S3 and
+MinIO do). If it doesn't, rift says so in its log: then run exactly one gateway without
+`--serve-only`.
 
-The soak test already pushes, deletes, collects and kills gateways while checking every blob
-byte-exact. For HA it would run 3 gateways behind a round-robin proxy and kill a random one
-(compactor included) every few seconds. The pass criteria: no mismatch, no failed pull other than
-one in-flight on the killed gateway, and a clean bucket audit at the end.
+The compactor's own catalog follows the bucket too: each round it reads the manifests' names from
+its listing, forgets blobs deleted or replaced through serving gateways, and GC counts as live
+every manifest in the bucket, not what any gateway remembers.
+
+## Reads on every gateway count
+
+`--cold-after` means "not written or read for this long". Serving gateways hand the blobs they
+served to the compactor every minute (`.rift/reads/`), so blobs read through any gateway count as
+read.
+
+## What failover looks like
+
+| What goes | Effect |
+|---|---|
+| A serving gateway | Requests in flight on it fail and are retried by the registry; the Service sends new ones to the others |
+| The compactor | Compaction, cooling and GC pause; serving goes on. After a crash Kubernetes restarts it and it carries on at once; a new pod (an upgrade, a lost node) waits up to two minutes for the old lock to go stale. A standby compactor, if you run one, takes over after about two minutes |
+| The bucket | Everything waits for it, as without rift |
+
+## Upgrading from 0.1.4
+
+The chart keeps the single gateway's Deployment as the compactor and adds the serving one, then
+points the Service at the serving gateways. Expect a few seconds without a ready endpoint while
+they first start. Stubs written before 0.1.5 carry no date; gateways find their manifests by name.
 
 ## Cost
 
-Phase 1 adds one LIST every 5 seconds per serving gateway (the journal), about 518,000 requests or
-$2.60 a month each on S3 Standard, and one PUT per compaction batch. Phase 2 adds a lease PUT every 10 seconds (about 260,000 a month,
-roughly $1.30 on S3 Standard).
+Per gateway, about a dollar a month in S3 requests on S3 Standard: the lock's renewals (one PUT
+every 20 seconds, from the compactor), the hourly catalog read (one LIST per 1,000 compacted
+blobs), and at most one PUT a minute of reads. Redirects cost one HEAD each, and cold reads one
+more request each.
+
+## Tested
+
+- **Soak on MinIO** (`rift-test/soak_ha.py`): two compactors (one standing by), two serving
+  gateways behind a round-robin proxy, and a registry with redirects on. For 25 minutes it pushed
+  131 images, deleted 39 tags and ran registry GC 30 times, killed serving gateways 32 times and
+  the active compactor 9 times (3 during a compaction; 4 times it stayed down long enough for the
+  standby to take over). 807 blobs (1.3 GB) were read back through the serving gateways and
+  checked against their digests: no mismatch and no failed read. The bucket audit found nothing
+  missing and nothing left over.
+- **Deletes through serving gateways**: every tag deleted and the registry's GC run (304 blobs
+  deleted through the serving gateways); the compactor noticed, collected, and after the grace
+  period the bucket held no packs at all.
+- **AWS S3** (us-east-1, gateways on a laptop): the same layout. S3 honours the conditional
+  writes; the serving gateways rebuilt blobs the compactor had compacted and redirected the rest;
+  after the compactor was killed the standby took over in 125 seconds and carried on. Every blob
+  byte-exact, audit clean.
+
+## Not yet
+
+- **Fencing against a paused compactor.** A compactor frozen (a stopped VM, say) for longer than
+  the lock's two minutes could finish a step it had started once it wakes. The chart runs one
+  compactor, so this needs a second one running as well. An epoch carried by every destructive
+  step would close it.
+- **A standby compactor in the chart.** It works (see Tested), but the chart runs one compactor:
+  Kubernetes restarts it within a minute, and a standby holds memory for nothing most of the time.
