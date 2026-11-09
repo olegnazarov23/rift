@@ -50,7 +50,7 @@ is, and the report says how many there were and why.
     --max-gb N       stop after N GB of input
     --threads N      default: all cores
     --price P        $/GB-month for the cost line (default 0.023, S3 Standard)
-    --level L        zstd level for the packs (default 19, as the store; 9 is faster, ~4 points low)
+    --level L        zstd level for the packs (default 18, as the store; 9 is faster, ~4 points low)
     --no-verify      skip the rebuild check (faster)
     --json           machine-readable report
 

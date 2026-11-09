@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 
 use crate::{
-    cas::{EMPTY_SHA256, Manifest, Store, blob_digest},
+    cas::{Cold, EMPTY_SHA256, Manifest, Store, blob_digest},
     lock::Lock,
     metrics::{METRICS, add, set},
     s3::{self, Backend, decode_aws_chunked, xml_all, xml_escape, xml_unescape},
@@ -1164,6 +1164,51 @@ pub fn serve_only(store: Arc<Store>, interval: Duration) {
     }
 }
 
+/// Compaction commits a batch at a time, so a backfill saves as it goes and an interruption loses
+/// one batch at most.
+const BATCH_BYTES: u64 = 2 << 30;
+const BATCH_BLOBS: usize = 1000;
+
+/// Consecutive runs of blobs of at most `bytes` (or one bigger blob) and `blobs` in number.
+fn batches(cold: &[Cold], bytes: u64, blobs: usize) -> Vec<&[Cold]> {
+    let (mut out, mut start, mut size) = (Vec::new(), 0, 0u64);
+    for (i, c) in cold.iter().enumerate() {
+        if i > start && (size + c.size > bytes || i - start >= blobs) {
+            out.push(&cold[start..i]);
+            (start, size) = (i, 0);
+        }
+        size += c.size;
+    }
+    if start < cold.len() {
+        out.push(&cold[start..]);
+    }
+    out
+}
+
+/// For each blob (by digest), the most layers any repository it's a layer of has, from the
+/// registry's layer links (`.../repositories/<name>/_layers/sha256/<digest>/link`). Registries
+/// that keep this in a database (GitLab's, in metadata mode) have none: everything counts 0.
+fn layer_counts(objects: &[s3::Object]) -> HashMap<String, usize> {
+    let link = |key: &str| -> Option<(String, String)> {
+        let rest = key.strip_suffix("/link")?;
+        let (repo, digest) = rest.split_once("/_layers/sha256/")?;
+        let repo = repo.rsplit_once("/repositories/").map_or(repo, |(_, r)| r);
+        (digest.len() == 64).then(|| (repo.to_string(), digest.to_string()))
+    };
+    let links: Vec<(String, String)> = objects.iter().filter_map(|o| link(&o.key)).collect();
+    let mut per_repo: HashMap<&str, usize> = HashMap::new();
+    for (repo, _) in &links {
+        *per_repo.entry(repo.as_str()).or_default() += 1;
+    }
+    let mut out: HashMap<String, usize> = HashMap::new();
+    for (repo, digest) in &links {
+        let n = per_repo[repo.as_str()];
+        let best = out.entry(digest.clone()).or_default();
+        *best = (*best).max(n);
+    }
+    out
+}
+
 /// Every `interval` (the first round within a minute of starting), while this gateway holds the
 /// compactor lock: lists the bucket, catches up with what other gateways deleted or replaced,
 /// stubs idle hot copies again, compacts cold blobs, then reclaims chunks of deleted ones (always
@@ -1211,6 +1256,7 @@ pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, loc
                 set(&METRICS.bucket_logical_bytes, logical);
                 set(&METRICS.bucket_stored_bytes, stored);
                 set(&METRICS.bucket_listed_at, now);
+                let layers = layer_counts(&objects);
                 let (mut cold, mut cooling) = (Vec::new(), Vec::new());
                 for o in objects.into_iter().filter(|o| !o.key.starts_with(".rift/")) {
                     let Some(digest) = blob_digest(&o.key) else { continue };
@@ -1230,7 +1276,7 @@ pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, loc
                                 store.keep(&o.key, &o.etag, &format!("{} MB, over --max-unpacked-mb", o.size >> 20));
                                 add(&METRICS.compaction_failures, 1);
                             } else {
-                                cold.push((o.key, digest, o.modified));
+                                cold.push(Cold { key: o.key, digest, mtime: o.modified, size: o.size });
                             }
                         }
                         None => {}
@@ -1245,19 +1291,29 @@ pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, loc
                     eprintln!("rift: stubbed {cooled} hot copies again");
                 }
                 if !cold.is_empty() && go() {
-                    eprintln!("rift: compacting {} cold blobs", cold.len());
-                    let started = std::time::Instant::now();
-                    let (done, bytes) = store.compact(&cold, s.threads, &go);
-                    add(&METRICS.compactions, done as u64);
-                    add(&METRICS.compacted_bytes, bytes);
-                    add(&METRICS.compaction_ms, started.elapsed().as_millis() as u64);
-                    add(&METRICS.compaction_failures, (cold.len() - done) as u64);
-                    eprintln!(
-                        "rift: compacted {done} of {} blobs ({:.1} MB) in {:.1}s",
-                        cold.len(),
-                        bytes as f64 / 1e6,
-                        started.elapsed().as_secs_f64()
-                    );
+                    let total: u64 = cold.iter().map(|c| c.size).sum();
+                    eprintln!("rift: compacting {} cold blobs ({:.1} MB)", cold.len(), total as f64 / 1e6);
+                    // what saves the most first: layers of repositories with many layers (versions
+                    // that share most of their content), then the biggest
+                    cold.sort_by_key(|c| (std::cmp::Reverse(layers.get(&c.digest).copied().unwrap_or(0)), std::cmp::Reverse(c.size)));
+                    for batch in batches(&cold, BATCH_BYTES, BATCH_BLOBS) {
+                        if !go() {
+                            break;
+                        }
+                        let started = std::time::Instant::now();
+                        let (done, bytes, phases) = store.compact(batch, s.threads, &go);
+                        add(&METRICS.compactions, done as u64);
+                        add(&METRICS.compacted_bytes, bytes);
+                        add(&METRICS.compaction_ms, started.elapsed().as_millis() as u64);
+                        add(&METRICS.compaction_failures, (batch.len() - done) as u64);
+                        eprintln!(
+                            "rift: compacted {done} of {} blobs ({:.1} MB) in {:.1}s ({phases})",
+                            batch.len(),
+                            bytes as f64 / 1e6,
+                            started.elapsed().as_secs_f64()
+                        );
+                        store.publish_totals();
+                    }
                 }
             }
             Err(e) => eprintln!("rift: compactor can't list the bucket: {e:#}"),
@@ -1638,6 +1694,32 @@ mod tests {
         assert!(!out.contains(".rift/"));
         assert!(out.contains("<Key>b</Key><Size>7</Size>"));
         assert!(out.contains("<KeyCount>2</KeyCount>"));
+    }
+
+    #[test]
+    fn batches_of_cold_blobs() {
+        let c = |size| Cold { key: String::new(), digest: String::new(), mtime: 0, size };
+        let cold = [c(5), c(5), c(5), c(20), c(1), c(1), c(1)];
+        let sizes = |bs: Vec<&[Cold]>| bs.iter().map(|b| b.iter().map(|c| c.size).collect::<Vec<_>>()).collect::<Vec<_>>();
+        assert_eq!(sizes(batches(&cold, 10, 100)), vec![vec![5, 5], vec![5], vec![20], vec![1, 1, 1]], "a bigger blob goes alone");
+        assert_eq!(sizes(batches(&cold, 100, 3)), vec![vec![5, 5, 5], vec![20, 1, 1], vec![1]]);
+        assert!(batches(&[], 10, 10).is_empty());
+    }
+
+    #[test]
+    fn repositories_with_more_layers_first() {
+        let d = |c: char| c.to_string().repeat(64);
+        let link = |repo: &str, c: char| s3::Object {
+            key: format!("docker/registry/v2/repositories/{repo}/_layers/sha256/{}/link", d(c)),
+            size: 71,
+            modified: 0,
+            etag: String::new(),
+        };
+        // ci/app has 3 layers (two builds sharing a base), library/redis 1; the base is in both
+        let objects = [link("ci/app", 'a'), link("ci/app", 'b'), link("ci/app", 'c'), link("library/redis", 'a'), link("library/redis", 'r')];
+        let n = layer_counts(&objects);
+        assert_eq!((n[&d('a')], n[&d('b')], n[&d('r')]), (3, 3, 2));
+        assert!(layer_counts(&[s3::Object { key: "docker/registry/v2/blobs/sha256/aa/x/data".into(), size: 1, modified: 0, etag: String::new() }]).is_empty());
     }
 
     #[test]

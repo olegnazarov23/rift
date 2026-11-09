@@ -30,7 +30,7 @@ compaction:
   # each round lists the bucket: one LIST request per 1,000 objects
   interval: 1h
   minSizeMB: 1
-  packLevel: 19
+  packLevel: 18
   # put a blob's original bytes back after a cold read, until it goes cold again
   hotCopy: true
   # the most a blob may unpack to; compaction peaks near 2.5x this plus ~135 MB per thread, so

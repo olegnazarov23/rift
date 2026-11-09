@@ -283,8 +283,10 @@ policy above.
 
 - One compactor per bucket at a time. If it's down, serving goes on but compaction and GC wait;
   a standby compactor takes over after two minutes ([High availability](HA.md)).
-- Compaction runs at about 0.5 MB/s per core. A large registry takes a while to backfill; new
-  pushes are a small daily stream.
+- Compaction ran at 19 MB/s on a 12-core server (Ryzen 9 5900X; 1.3 GB of layers from 148 official
+  images in 67 s, 64% saved) and 2.3 MB/s on a 6-core laptop. A backfill commits about 2 GB at a
+  time, starting with the repositories with the most layers, where most is saved. New pushes are a
+  small daily stream.
 - A cold pull of a big layer on few cores is slower than a plain download, about 2–3× on 6 cores.
 - gzip layers only; zstd and eStargz layers are left as they are.
 - Blobs that unpack to more than `--max-unpacked-mb` stay as they are, so the biggest layers of ML

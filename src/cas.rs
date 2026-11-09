@@ -11,6 +11,7 @@ use std::{
     sync::{
         Arc, Condvar, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -241,8 +242,9 @@ pub enum Unpacked {
     TooBig,
 }
 
-/// Unpacks a single-member gzip blob, stopping once the plain text passes `limit` bytes.
-pub fn analyze(key: &str, digest: &str, mtime: u64, data: &[u8], threads: usize, limit: usize) -> Result<Unpacked> {
+/// Unpacks a single-member gzip blob, stopping once the plain text passes `limit` bytes. Adds the
+/// time spent compressing the recipe to `recipe_time`.
+pub fn analyze(key: &str, digest: &str, mtime: u64, data: &[u8], threads: usize, limit: usize, recipe_time: &mut Duration) -> Result<Unpacked> {
     let Some(start) = gzip_payload_offset(data) else { return Ok(Unpacked::Not) };
     let config = PreflateConfig { max_chain_length: 4096, plain_text_limit: limit, verify_compression: false };
     let (raw, deflate_len, plain) = match preflate_independent(&data[start..], &config, GROUP_PLAIN, threads) {
@@ -254,7 +256,9 @@ pub fn analyze(key: &str, digest: &str, mtime: u64, data: &[u8], threads: usize,
         return Ok(Unpacked::Not);
     }
     let trailer = data[start + deflate_len..].to_vec();
+    let started = Instant::now();
     let recipe = zstd::bulk::compress(&raw, 19)?;
+    *recipe_time += started.elapsed();
     let m = Manifest::new(key.into(), data.len() as u64, digest.into(), mtime, data[..start].to_vec(), trailer, Vec::new(), Vec::new(), recipe);
     Ok(Unpacked::Done(m, plain))
 }
@@ -306,8 +310,15 @@ pub fn complete(m: &mut Manifest, workers: usize, pack: &PackFn) -> Result<bool>
 }
 
 
-/// Puts unique chunks into packs. Full packs queue up and are compressed in parallel, then handed to
-/// `store(id, zstd bytes, index bytes)`; a chunk is only safe to rely on after `flush` succeeds.
+/// Stores a compressed pack and its index: (id, zstd bytes, index bytes).
+pub type StoreFn = dyn Fn(u32, Vec<u8>, Vec<u8>) -> Result<()> + Send + Sync;
+
+/// What a pack compressed and stored in the background came to: its id, chunks and stored size.
+type PackJob = thread::JoinHandle<(u32, Vec<Entry>, Result<u64>)>;
+
+/// Puts unique chunks into packs. Each full pack is compressed and stored in the background (at
+/// most `threads` at a time) while chunking goes on; a chunk is only safe to rely on after `flush`
+/// succeeds.
 pub struct Packer {
     index: Arc<Index>,
     /// chunks in packs not stored yet
@@ -319,16 +330,19 @@ pub struct Packer {
     id: u32,
     data: Vec<u8>,
     entries: Vec<Entry>,
-    /// full packs not stored yet
-    queued: Vec<(u32, Vec<u8>, Vec<Entry>)>,
     level: i32,
     threads: usize,
+    store: Arc<StoreFn>,
+    /// packs being compressed and stored, oldest first
+    jobs: VecDeque<PackJob>,
+    /// the first pack that failed since the last flush
+    failed: Option<anyhow::Error>,
+    /// wall time spent waiting for packs (a full queue, or `flush`), for the compaction log
+    pub flush_time: Duration,
 }
 
-pub type PackStore<'a> = dyn Fn(u32, Vec<u8>, Vec<u8>) -> Result<()> + Sync + 'a;
-
 impl Packer {
-    pub fn new(index: Arc<Index>, packs: HashMap<u32, (u64, u64)>, next_id: u32, level: i32, threads: usize) -> Self {
+    pub fn new(index: Arc<Index>, packs: HashMap<u32, (u64, u64)>, next_id: u32, level: i32, threads: usize, store: Arc<StoreFn>) -> Self {
         Self {
             index,
             pending: HashMap::new(),
@@ -337,24 +351,27 @@ impl Packer {
             id: next_id,
             data: Vec::with_capacity(PACK_BYTES),
             entries: Vec::new(),
-            queued: Vec::new(),
             level,
             threads: threads.max(1),
+            store,
+            jobs: VecDeque::new(),
+            failed: None,
+            flush_time: Duration::ZERO,
         }
     }
 
     /// Cuts `plain` into chunks and returns their refs; new chunks go into the open pack.
-    pub fn add(&mut self, plain: &[u8], store: &PackStore) -> Result<Vec<Ref>> {
+    pub fn add(&mut self, plain: &[u8]) -> Result<Vec<Ref>> {
         FastCDC::new(plain, 16 << 10, 64 << 10, 256 << 10)
             .map(|c| {
                 let bytes = &plain[c.offset..c.offset + c.length];
-                self.add_chunk(*blake3::hash(bytes).as_bytes(), bytes, store)
+                self.add_chunk(*blake3::hash(bytes).as_bytes(), bytes)
             })
             .collect()
     }
 
     /// Where an identical chunk is already stored, or where this one goes in the open pack.
-    pub fn add_chunk(&mut self, hash: [u8; 32], bytes: &[u8], store: &PackStore) -> Result<Ref> {
+    pub fn add_chunk(&mut self, hash: [u8; 32], bytes: &[u8]) -> Result<Ref> {
         if let Some(r) = self.pending.get(&hash) {
             return Ok(*r);
         }
@@ -365,9 +382,6 @@ impl Packer {
         }
         if self.data.len() + bytes.len() > PACK_BYTES {
             self.close();
-            if self.queued.len() >= self.threads {
-                self.flush(store)?;
-            }
         }
         let r = [self.id, self.data.len() as u32, bytes.len() as u32];
         self.data.extend_from_slice(bytes);
@@ -376,54 +390,69 @@ impl Packer {
         Ok(r)
     }
 
-    /// Queues the open pack.
+    /// Hands the open pack to a background job that compresses and stores it, first waiting for
+    /// the oldest job if `threads` are running.
     fn close(&mut self) {
-        if !self.data.is_empty() {
-            let data = std::mem::replace(&mut self.data, Vec::with_capacity(PACK_BYTES));
-            self.queued.push((self.id, data, std::mem::take(&mut self.entries)));
-            self.id += 1;
+        if self.data.is_empty() {
+            return;
+        }
+        let started = Instant::now();
+        while self.jobs.len() >= self.threads {
+            self.finish_oldest();
+        }
+        self.flush_time += started.elapsed();
+        let (id, level, store) = (self.id, self.level, self.store.clone());
+        let data = std::mem::replace(&mut self.data, Vec::with_capacity(PACK_BYTES));
+        let entries = std::mem::take(&mut self.entries);
+        self.id += 1;
+        self.jobs.push_back(thread::spawn(move || {
+            let stored = (|| -> Result<u64> {
+                let mut z = zstd::bulk::Compressor::new(level)?;
+                z.set_parameter(CParameter::EnableLongDistanceMatching(true))?;
+                z.set_parameter(CParameter::WindowLog(24))?;
+                let mut idx = Vec::with_capacity(entries.len() * 40);
+                for (h, at, len) in &entries {
+                    idx.extend(h);
+                    idx.extend(at.to_le_bytes());
+                    idx.extend(len.to_le_bytes());
+                }
+                let z = z.compress(&data)?;
+                let size = z.len() as u64;
+                store(id, z, idx).map(|_| size)
+            })();
+            (id, entries, stored)
+        }));
+    }
+
+    /// Waits for the oldest background pack and records it: indexed if it was stored, its chunks
+    /// forgotten either way (if it failed, nothing new may refer to them).
+    fn finish_oldest(&mut self) {
+        let Some(job) = self.jobs.pop_front() else { return };
+        let (id, entries, stored) = job.join().unwrap_or_else(|_| (u32::MAX, Vec::new(), Err(anyhow!("compressing a pack panicked"))));
+        for (h, ..) in &entries {
+            self.pending.remove(h);
+        }
+        let stored = stored.and_then(|size| {
+            // a stored pack the index doesn't know is caught at the next start, which rebuilds the index
+            self.index.add_packs(&[(id, size, entries.clone())]).context("indexing a stored pack")?;
+            self.packs.insert(id, (size, entries.iter().map(|e| u64::from(e.2)).sum()));
+            Ok(())
+        });
+        if let Err(e) = stored {
+            self.failed.get_or_insert(e.context(format!("storing pack {id}")));
         }
     }
 
-    /// Compresses and stores every queued pack and the open one, in parallel, then indexes them.
-    /// Chunks of a pack that fails to store are forgotten, so nothing later refers to them.
-    pub fn flush(&mut self, store: &PackStore) -> Result<()> {
+    /// Closes the open pack and waits for every pack to be stored. An error if any failed; the
+    /// chunks of a failed pack are forgotten, so nothing later refers to them.
+    pub fn flush(&mut self) -> Result<()> {
         self.close();
-        let queued = std::mem::take(&mut self.queued);
-        let level = self.level;
-        let results = parallel(queued.len(), self.threads, |i| -> Result<u64> {
-            let (id, data, entries) = &queued[i];
-            let mut z = zstd::bulk::Compressor::new(level)?;
-            z.set_parameter(CParameter::EnableLongDistanceMatching(true))?;
-            z.set_parameter(CParameter::WindowLog(24))?;
-            let mut idx = Vec::with_capacity(entries.len() * 40);
-            for (h, at, len) in entries {
-                idx.extend(h);
-                idx.extend(at.to_le_bytes());
-                idx.extend(len.to_le_bytes());
-            }
-            let z = z.compress(data)?;
-            let size = z.len() as u64;
-            store(*id, z, idx).map(|_| size)
-        });
-        let (mut stored, mut failed) = (Vec::new(), None);
-        for ((id, _, entries), result) in queued.into_iter().zip(results) {
-            for (h, ..) in &entries {
-                self.pending.remove(h);
-            }
-            match result {
-                Ok(size) => stored.push((id, size, entries)),
-                Err(e) => {
-                    failed.get_or_insert(e.context(format!("storing pack {id}")));
-                }
-            }
+        let started = Instant::now();
+        while !self.jobs.is_empty() {
+            self.finish_oldest();
         }
-        // a stored pack the index doesn't know is caught at the next start, which rebuilds the index
-        self.index.add_packs(&stored).context("indexing stored packs")?;
-        for (id, size, entries) in &stored {
-            self.packs.insert(*id, (*size, entries.iter().map(|e| u64::from(e.2)).sum()));
-        }
-        failed.map_or(Ok(()), Err)
+        self.flush_time += started.elapsed();
+        self.failed.take().map_or(Ok(()), Err)
     }
 
     /// Drops packs that are about to be deleted, so nothing new refers to their chunks. Returns
@@ -680,6 +709,100 @@ pub fn stream(m: &Manifest, start: u64, end: u64, workers: usize, pack: &PackFn,
     Ok(())
 }
 
+/// Where a compaction's time went, for the log.
+#[derive(Default)]
+pub struct Phases {
+    /// wall time of the first stage (download, check, unpack, chunk), with this many blobs at a time
+    pub analysis: Duration,
+    pub at_once: usize,
+    // summed over the blobs unpacked at once
+    pub download: Duration,
+    pub check: Duration,
+    pub unpack: Duration,
+    pub recipe: Duration,
+    pub chunk: Duration,
+    /// waiting for packs to be compressed and stored
+    pub packs: Duration,
+    /// rebuilding from the bucket, checking and committing, writes included (wall time)
+    pub verify: Duration,
+}
+
+impl Phases {
+    fn add(&mut self, other: &Phases) {
+        self.download += other.download;
+        self.check += other.check;
+        self.unpack += other.unpack;
+        self.recipe += other.recipe;
+    }
+}
+
+impl std::fmt::Display for Phases {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let s = |d: Duration| d.as_secs_f64();
+        write!(
+            f,
+            "unpacking {:.1}s, {} at a time (download {:.1}s, digest {:.1}s, unpack {:.1}s, recipe {:.1}s summed), chunk {:.1}s, waiting for packs {:.1}s, verify {:.1}s",
+            s(self.analysis),
+            self.at_once,
+            s(self.download),
+            s(self.check),
+            s(self.unpack),
+            s(self.recipe),
+            s(self.chunk),
+            s(self.packs),
+            s(self.verify)
+        )
+    }
+}
+
+/// A blob to compact: its key, sha256, last-modified and size.
+pub struct Cold {
+    pub key: String,
+    pub digest: String,
+    pub mtime: u64,
+    pub size: u64,
+}
+
+/// Bytes of plain text the blobs being unpacked at once may hold.
+struct Budget {
+    total: u64,
+    left: Mutex<u64>,
+    freed: Condvar,
+}
+
+impl Budget {
+    fn new(total: u64) -> Self {
+        Self { total, left: Mutex::new(total), freed: Condvar::new() }
+    }
+
+    /// Waits until `n` bytes (at most the whole budget) are free and takes them.
+    fn take(&self, n: u64) -> Share<'_> {
+        let n = n.min(self.total);
+        let mut left = self.freed.wait_while(self.left.lock().unwrap(), |left| *left < n).unwrap();
+        *left -= n;
+        Share(self, n)
+    }
+}
+
+/// Part of a budget, given back when dropped.
+struct Share<'a>(&'a Budget, u64);
+
+impl Drop for Share<'_> {
+    fn drop(&mut self) {
+        *self.0.left.lock().unwrap() += self.1;
+        self.0.freed.notify_all();
+    }
+}
+
+/// What unpacking one blob came to.
+enum Unpack {
+    Ready(Box<Manifest>, Vec<u8>, String),
+    /// it unpacks to more than its share of the budget: try it again alone
+    Alone,
+    /// kept as it is, or failed this round
+    Skip,
+}
+
 /// What's kept in memory per compacted blob; its manifest is loaded when needed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BlobInfo {
@@ -758,6 +881,16 @@ fn manifest_names(objects: &[Object]) -> HashMap<String, BlobInfo> {
         }
     }
     out
+}
+
+/// Writes a new object of rift's own: with `create_only`, only where nothing is.
+fn put_new(backend: &Backend, create_only: bool, key: &str, body: Vec<u8>) -> Result<String> {
+    if !create_only {
+        return backend.put(key, body, &[]);
+    }
+    backend
+        .put_if(key, body, &[("if-none-match".into(), "*".into())])?
+        .with_context(|| format!("{key} already exists: is another compactor writing to this bucket?"))
 }
 
 /// What a stub carries: its blob's size and date, and the version it replaces.
@@ -877,7 +1010,13 @@ impl Store {
         // whoever compacted meanwhile may have pointed manifests at other packs: GC must not go
         // by copies cached before
         self.manifests.clear();
-        *self.packer.lock().unwrap() = Some(Packer::new(index, packs, next, self.level, self.threads));
+        let (backend, create_only) = (self.backend.clone(), self.create_only.load(Ordering::Relaxed));
+        let store: Arc<StoreFn> = Arc::new(move |id: u32, pack: Vec<u8>, idx: Vec<u8>| {
+            put_new(&backend, create_only, &pack_key(id), pack)?;
+            put_new(&backend, create_only, &idx_key(id), idx)?;
+            Ok(())
+        });
+        *self.packer.lock().unwrap() = Some(Packer::new(index, packs, next, self.level, self.threads, store));
         // named before sizes went into the name: read once and renamed
         for o in self.backend.list(MANIFESTS)? {
             if parse_manifest_key(&o.key).is_some() {
@@ -1249,7 +1388,6 @@ impl Store {
             }
         }
         self.forgotten.store(0, Ordering::Relaxed);
-        let store = |i: u32, z: Vec<u8>, x: Vec<u8>| self.store_pack(i, z, x);
         // what's live is every manifest in the bucket: serving drops catalog entries this gateway
         // can't use, which must never make their chunks look unused
         let blobs: Vec<(String, BlobInfo)> = manifest_names(&self.backend.list(MANIFESTS)?).into_iter().collect();
@@ -1301,10 +1439,10 @@ impl Store {
                 let used = live.get(&id);
                 for &(h, at, len) in entries.iter().filter(|e| used.is_some_and(|u| u.contains(&e.1))) {
                     let bytes = data.get(at as usize..(at + len) as usize).context("chunk outside its pack")?;
-                    moved.insert((id, at), packer.add_chunk(h, bytes, &store)?);
+                    moved.insert((id, at), packer.add_chunk(h, bytes)?);
                 }
             }
-            packer.flush(&store)
+            packer.flush()
         })();
         packer.exclude.clear();
         // on failure the old packs are still what every manifest uses; copies made so far just serve dedup
@@ -1345,18 +1483,7 @@ impl Store {
 
     /// Writes a new object of rift's own: only where nothing is, when the bucket can check that.
     fn put_new(&self, key: &str, body: Vec<u8>) -> Result<String> {
-        if !self.create_only.load(Ordering::Relaxed) {
-            return self.backend.put(key, body, &[]);
-        }
-        self.backend
-            .put_if(key, body, &[("if-none-match".into(), "*".into())])?
-            .with_context(|| format!("{key} already exists: is another compactor writing to this bucket?"))
-    }
-
-    fn store_pack(&self, id: u32, pack: Vec<u8>, idx: Vec<u8>) -> Result<()> {
-        self.put_new(&pack_key(id), pack)?;
-        self.put_new(&idx_key(id), idx)?;
-        Ok(())
+        put_new(&self.backend, self.create_only.load(Ordering::Relaxed), key, body)
     }
 
     /// Leaves a blob as it is from now on (`etag` "*": whatever its version), saying why once.
@@ -1370,75 +1497,176 @@ impl Store {
         self.kept.has(key, etag)
     }
 
-    /// Compacts the given blobs (key, sha256, last-modified) while `go()`; returns how many were
-    /// compacted and the bytes they took before. A blob that can't be compacted, or that unpacks
-    /// past `max_unpacked` or MAX_RATIO times its size, is kept as is.
-    pub fn compact(&self, blobs: &[(String, String, u64)], threads: usize, go: &dyn Fn() -> bool) -> (usize, u64) {
-        let Some(index) = self.index.clone() else { return (0, 0) };
-        let mut ready = Vec::new();
-        for (key, digest, mtime) in blobs {
+    /// Compacts the given blobs while `go()`; returns how many were compacted, the bytes they took
+    /// before, and where the time went. Several are unpacked at once, holding at most
+    /// `max_unpacked` bytes of plain text between them; one that would unpack past its share is
+    /// tried again alone. A blob that can't be compacted, or that unpacks past `max_unpacked` or
+    /// MAX_RATIO times its size, is kept as is.
+    pub fn compact(&self, blobs: &[Cold], threads: usize, go: &(dyn Fn() -> bool + Sync)) -> (usize, u64, Phases) {
+        let mut t = Phases::default();
+        let Some(index) = self.index.clone() else { return (0, 0, t) };
+        let flushed = |packer: &Option<Packer>| packer.as_ref().map_or(Duration::ZERO, |p| p.flush_time);
+        let flushed_before = flushed(&self.packer.lock().unwrap());
+        // stage 1: blobs unpacked several at a time (preflate spreads a big one over the threads
+        // too); their plain text chunked here as it comes, the packs compressed in the background
+        let at_once = (threads / 4).clamp(1, 8).min(blobs.len().max(1));
+        t.at_once = at_once;
+        let budget = Budget::new(self.max_unpacked);
+        let (sums, alone, next) = (Mutex::new(Phases::default()), Mutex::new(Vec::new()), AtomicUsize::new(0));
+        let mut ready: Vec<(Manifest, String)> = Vec::new();
+        let started = Instant::now();
+        thread::scope(|scope| {
+            let (tx, rx) = mpsc::sync_channel::<(Manifest, Vec<u8>, String, Share)>(1);
+            for _ in 0..at_once {
+                let (tx, budget, sums, alone, next, index) = (tx.clone(), &budget, &sums, &alone, &next, &index);
+                scope.spawn(move || {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(blob) = blobs.get(i) else { break };
+                        if !go() {
+                            break;
+                        }
+                        let full = self.max_unpacked.min(blob.size.saturating_mul(MAX_RATIO));
+                        // a layer typically unpacks to 2 to 4 times its size
+                        let share = if at_once > 1 { full.min(blob.size.saturating_mul(10)) } else { full };
+                        let taken = budget.take(share);
+                        let mut mine = Phases::default();
+                        let unpacked = self.unpack(index, blob, share, full, threads, &mut mine);
+                        sums.lock().unwrap().add(&mine);
+                        match unpacked {
+                            Unpack::Ready(m, plain, etag) => {
+                                if tx.send((*m, plain, etag, taken)).is_err() {
+                                    break;
+                                }
+                            }
+                            Unpack::Alone => alone.lock().unwrap().push(i),
+                            Unpack::Skip => {}
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            for (m, plain, etag, taken) in rx {
+                self.chunk(m, &plain, etag, &mut ready, &mut t);
+                drop(taken);
+            }
+        });
+        // the few that unpack to more than their share: one at a time, with the whole budget
+        for i in alone.into_inner().unwrap() {
             if !go() {
                 break;
             }
-            // counted on disk first: a blob that keeps taking rift down isn't tried forever
-            if index.begin_attempt(key).unwrap_or(1) > MAX_TRIES {
-                self.keep(key, "*", &format!("rift stopped {MAX_TRIES} times while compacting it"));
-                continue;
+            let blob = &blobs[i];
+            let full = self.max_unpacked.min(blob.size.saturating_mul(MAX_RATIO));
+            let mut mine = Phases::default();
+            if let Unpack::Ready(m, plain, etag) = self.unpack(&index, blob, full, full, threads, &mut mine) {
+                self.chunk(*m, &plain, etag, &mut ready, &mut t);
             }
-            let attempt = (|| -> Result<std::result::Result<(Manifest, String), (String, String)>> {
-                let (data, etag) = self.backend.get(key)?;
-                if sha256_hex(&data) != *digest {
-                    return Ok(Err((etag, "content doesn't match its digest".into())));
-                }
-                let limit = self.max_unpacked.min(data.len() as u64 * MAX_RATIO);
-                match analyze(key, digest, *mtime, &data, threads, limit as usize)? {
-                    Unpacked::Done(mut m, plain) => {
-                        let mut packer = self.packer.lock().unwrap();
-                        let refs = packer.as_mut().context("not the compactor")?.add(&plain, &|id, z, idx| self.store_pack(id, z, idx))?;
-                        m.set_refs(refs);
-                        Ok(Ok((m, etag)))
-                    }
-                    Unpacked::Not => Ok(Err((etag, "not rebuildable byte-exact".into()))),
-                    Unpacked::TooBig => Ok(Err((etag, format!("unpacks to more than {} MB", limit.div_ceil(1 << 20))))),
-                }
-            })();
-            let _ = index.end_attempt(key);
-            match attempt {
-                Ok(Ok(r)) => ready.push(r),
-                Ok(Err((etag, why))) => self.keep(key, &etag, &why),
-                // e.g. the bucket didn't answer: tried again next round
-                Err(e) => eprintln!("rift: {key}: {e:#}"),
-            }
+            sums.lock().unwrap().add(&mine);
         }
+        t.add(&sums.into_inner().unwrap());
         if let Some(packer) = self.packer.lock().unwrap().as_mut()
-            && let Err(e) = packer.flush(&|id, z, idx| self.store_pack(id, z, idx))
+            && let Err(e) = packer.flush()
         {
             eprintln!("rift: storing a pack failed, its blobs stay as they were: {e:#}");
         }
-        let (mut done, mut bytes) = (0, 0);
-        for (m, etag) in ready {
+        t.analysis = started.elapsed();
+        t.packs = flushed(&self.packer.lock().unwrap()).saturating_sub(flushed_before);
+        // stage 2: each blob rebuilt from what's in the bucket, several at a time (the biggest
+        // first, each on a share of the threads), sharing the packs they read
+        ready.sort_by_key(|(m, _)| std::cmp::Reverse(m.size));
+        let started = Instant::now();
+        let verifying = ready.len().clamp(1, threads.div_ceil(2).max(1));
+        let workers = (threads / verifying).max(1);
+        let fresh = PackCache::new(32);
+        let ready: Vec<Mutex<Option<(Manifest, String)>>> = ready.into_iter().map(|r| Mutex::new(Some(r))).collect();
+        let committed = parallel(ready.len(), verifying, |i| {
+            let (m, etag) = ready[i].lock().unwrap().take().expect("each once");
             // the packs are stored; these blobs are compacted next round, by whoever compacts then
             if !go() {
-                break;
+                return None;
             }
             let (key, size) = (m.key.clone(), m.size);
-            match self.commit(m, &etag, threads) {
-                Ok(true) => {
-                    done += 1;
-                    bytes += size;
+            match self.commit(m, &etag, workers, &fresh) {
+                Ok(true) => Some(size),
+                Ok(false) => {
+                    eprintln!("rift: {key}: stored form didn't rebuild exactly, kept as is");
+                    None
                 }
-                Ok(false) => eprintln!("rift: {key}: stored form didn't rebuild exactly, kept as is"),
-                Err(e) => eprintln!("rift: {key}: {e:#}"),
+                Err(e) => {
+                    eprintln!("rift: {key}: {e:#}");
+                    None
+                }
             }
+        });
+        t.verify = started.elapsed();
+        let sizes: Vec<u64> = committed.into_iter().flatten().collect();
+        (sizes.len(), sizes.iter().sum(), t)
+    }
+
+    /// Downloads, checks and unpacks one blob, its plain text held to `limit` bytes (`full`: the
+    /// most it may ever unpack to).
+    fn unpack(&self, index: &Index, blob: &Cold, limit: u64, full: u64, threads: usize, t: &mut Phases) -> Unpack {
+        // counted on disk first: a blob that keeps taking rift down isn't tried forever
+        if index.begin_attempt(&blob.key).unwrap_or(1) > MAX_TRIES {
+            self.keep(&blob.key, "*", &format!("rift stopped {MAX_TRIES} times while compacting it"));
+            return Unpack::Skip;
         }
-        (done, bytes)
+        let attempt = (|| -> Result<Unpack> {
+            let started = Instant::now();
+            let (data, etag) = self.backend.get(&blob.key)?;
+            t.download += started.elapsed();
+            let started = Instant::now();
+            let matches = sha256_hex(&data) == blob.digest;
+            t.check += started.elapsed();
+            if !matches {
+                self.keep(&blob.key, &etag, "content doesn't match its digest");
+                return Ok(Unpack::Skip);
+            }
+            let (started, recipe_before) = (Instant::now(), t.recipe);
+            let unpacked = analyze(&blob.key, &blob.digest, blob.mtime, &data, threads, limit as usize, &mut t.recipe)?;
+            t.unpack += started.elapsed() - (t.recipe - recipe_before);
+            Ok(match unpacked {
+                Unpacked::Done(m, plain) => Unpack::Ready(Box::new(m), plain, etag),
+                Unpacked::Not => {
+                    self.keep(&blob.key, &etag, "not rebuildable byte-exact");
+                    Unpack::Skip
+                }
+                Unpacked::TooBig if limit < full => Unpack::Alone,
+                Unpacked::TooBig => {
+                    self.keep(&blob.key, &etag, &format!("unpacks to more than {} MB", limit.div_ceil(1 << 20)));
+                    Unpack::Skip
+                }
+            })
+        })();
+        let _ = index.end_attempt(&blob.key);
+        attempt.unwrap_or_else(|e| {
+            // e.g. the bucket didn't answer: tried again next round
+            eprintln!("rift: {}: {e:#}", blob.key);
+            Unpack::Skip
+        })
+    }
+
+    /// Chunks a blob's plain text into the packs; then it's ready to commit.
+    fn chunk(&self, mut m: Manifest, plain: &[u8], etag: String, ready: &mut Vec<(Manifest, String)>, t: &mut Phases) {
+        let mut packer = self.packer.lock().unwrap();
+        let Some(packer) = packer.as_mut() else { return };
+        let (started, flush_before) = (Instant::now(), packer.flush_time);
+        match packer.add(plain) {
+            Ok(refs) => {
+                m.set_refs(refs);
+                ready.push((m, etag));
+            }
+            Err(e) => eprintln!("rift: {}: {e:#}", m.key),
+        }
+        t.chunk += started.elapsed() - (packer.flush_time - flush_before);
     }
 
     /// Rebuilds the blob from what's stored (cold cache) and checks it against its digest, writes the
     /// manifest, and only then swaps the original for a stub.
-    fn commit(&self, mut m: Manifest, etag: &str, threads: usize) -> Result<bool> {
+    /// `fresh`: packs read from the bucket this round, never from before.
+    fn commit(&self, mut m: Manifest, etag: &str, threads: usize, fresh: &PackCache) -> Result<bool> {
         let key = m.key.clone();
-        let fresh = PackCache::new(32);
         if !complete(&mut m, threads, &|id| fresh.get(id, &|id| self.fetch_pack(id))).context("rebuild from the store")? {
             return Ok(false);
         }
@@ -1490,9 +1718,10 @@ mod tests {
         let blob = gzip(&vec![0u8; 64 << 20]);
         let digest = sha256_hex(&blob);
         let limit = blob.len() * MAX_RATIO as usize;
-        assert!(matches!(analyze("k", &digest, 0, &blob, 2, limit).unwrap(), Unpacked::TooBig));
-        assert!(matches!(analyze("k", &digest, 0, &blob, 2, 65 << 20).unwrap(), Unpacked::Done(..)), "under the limit it's fine");
-        assert!(matches!(analyze("k", &digest, 0, b"not gzip", 2, limit).unwrap(), Unpacked::Not));
+        let t = &mut Duration::ZERO;
+        assert!(matches!(analyze("k", &digest, 0, &blob, 2, limit, t).unwrap(), Unpacked::TooBig));
+        assert!(matches!(analyze("k", &digest, 0, &blob, 2, 65 << 20, t).unwrap(), Unpacked::Done(..)), "under the limit it's fine");
+        assert!(matches!(analyze("k", &digest, 0, b"not gzip", 2, limit, t).unwrap(), Unpacked::Not));
     }
 
     #[test]
@@ -1514,17 +1743,18 @@ mod tests {
         }
         let blob = gzip(&text);
         let digest = sha256_hex(&blob);
-        let Unpacked::Done(mut m, plain) = analyze("k", &digest, 0, &blob, 4, usize::MAX).unwrap() else { panic!("preflate takes it") };
-        let packs: Mutex<HashMap<u32, Arc<Vec<u8>>>> = Mutex::new(HashMap::new());
+        let Unpacked::Done(mut m, plain) = analyze("k", &digest, 0, &blob, 4, usize::MAX, &mut Duration::ZERO).unwrap() else { panic!("preflate takes it") };
+        let packs: Arc<Mutex<HashMap<u32, Arc<Vec<u8>>>>> = Arc::default();
         let dir = std::env::temp_dir().join(format!("rift-cas-test-{}", std::process::id()));
         let index = Arc::new(Index::open(&dir.join("index.redb")).unwrap());
-        let mut packer = Packer::new(index, HashMap::new(), 0, 3, 2);
-        let store = |id: u32, z: Vec<u8>, _idx: Vec<u8>| {
-            packs.lock().unwrap().insert(id, Arc::new(zstd::bulk::decompress(&z, 64 << 20)?));
+        let stored = packs.clone();
+        let store: Arc<StoreFn> = Arc::new(move |id: u32, z: Vec<u8>, _idx: Vec<u8>| {
+            stored.lock().unwrap().insert(id, Arc::new(zstd::bulk::decompress(&z, 64 << 20)?));
             Ok(())
-        };
-        let refs = packer.add(&plain, &store).unwrap();
-        packer.flush(&store).unwrap();
+        });
+        let mut packer = Packer::new(index, HashMap::new(), 0, 3, 2, store);
+        let refs = packer.add(&plain).unwrap();
+        packer.flush().unwrap();
         m.set_refs(refs);
         let pack = |id: u32| packs.lock().unwrap().get(&id).cloned().context("missing pack");
         assert!(complete(&mut m, 3, &pack).unwrap(), "rebuilds byte-exact");
