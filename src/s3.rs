@@ -45,7 +45,8 @@ impl Backend {
     }
 
     /// Sends a signed request. `rest` is the encoded path after the bucket ("" or "/key");
-    /// `headers` are lowercase and any `x-amz-*` among them is signed.
+    /// `headers` are lowercase, and all of them are signed: S3 refuses unsigned `x-amz-*` and
+    /// `content-md5` headers (MinIO doesn't check).
     pub fn send(
         &self,
         method: &str,
@@ -66,7 +67,7 @@ impl Backend {
         signed.extend(
             headers
                 .iter()
-                .filter(|(k, _)| k.starts_with("x-amz-") && k != "x-amz-content-sha256" && k != "x-amz-date")
+                .filter(|(k, _)| !matches!(k.as_str(), "host" | "x-amz-content-sha256" | "x-amz-date" | "x-amz-security-token"))
                 .map(|(k, v)| (k.as_str(), v.as_str())),
         );
         let (sig, signed_list) = sign(&keys.secret, &self.region, &date, method, &path, &q, &signed, "UNSIGNED-PAYLOAD");
@@ -324,6 +325,27 @@ pub fn decode_aws_chunked(body: &[u8], seed: Option<&Seed>) -> Result<(Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signs_every_header_it_sends() {
+        // S3 refuses a request that carries an unsigned content-md5; MinIO doesn't care
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = std::io::Read::read(&mut s, &mut buf).unwrap();
+            std::io::Write::write_all(&mut s, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase()
+        });
+        let backend = Backend::new(&endpoint, "b", "us-east-1", Credentials::fixed("AK", "SK")).unwrap();
+        let headers = [("content-md5", "XUFAKrxLKna5cZ2REBfFkg=="), ("content-type", "application/octet-stream"), ("x-amz-acl", "private")]
+            .map(|(k, v)| (k.to_string(), v.to_string()));
+        backend.send("PUT", "/k", &[], &headers, b"hello".to_vec()).unwrap();
+        let request = server.join().unwrap();
+        let signed = request.split("signedheaders=").nth(1).unwrap().split(',').next().unwrap();
+        assert_eq!(signed, "content-md5;content-type;host;x-amz-acl;x-amz-content-sha256;x-amz-date");
+    }
 
     #[test]
     fn chunked() {

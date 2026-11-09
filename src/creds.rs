@@ -117,6 +117,18 @@ impl Credentials {
         })
     }
 
+    /// Fixed keys, for tests.
+    #[cfg(test)]
+    pub fn fixed(access: &str, secret: &str) -> Self {
+        let (a, s) = (access.to_string(), secret.to_string());
+        Self::from_vars("us-east-1", &move |k| match k {
+            "RIFT_BACKEND_ACCESS_KEY" => Some(a.clone()),
+            "RIFT_BACKEND_SECRET_KEY" => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap()
+    }
+
     /// Where the keys come from, for the log.
     pub fn describe(&self) -> &str {
         &self.what
