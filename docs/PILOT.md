@@ -137,7 +137,8 @@ endpoint as well as the registry.
   `XAmzContentSHA256Mismatch`), every chunk of a signed `aws-chunked` upload is checked against its
   chunk signature, and trailing checksums (`x-amz-checksum-*`) go on to the bucket, which checks them.
 - `.rift/` isn't reachable through rift, so clients can't read or overwrite packs and manifests.
-- Logs never contain signatures or keys, also with `RIFT_DEBUG=1`, which logs every request.
+- Logs never contain signatures or keys, also with `RIFT_DEBUG=1` (every request, with headers)
+  and `--access-log` (a JSON audit line per request; see Watching it).
 
 **Limits.** Past these, a client gets 413 or 503 `SlowDown`; registries and S3 clients retry 503s.
 
@@ -237,6 +238,11 @@ policy above.
     `rift_redirects_total`: how pulls are served.
   - `rift_backend_errors_total`, `rift_cold_read_errors_total`: should stay at zero.
 - `GET /-/healthz` answers `{"status":"ok","compacted":N}`.
+- `--access-log` writes a JSON line per request to stdout: time, client address (and
+  `X-Forwarded-For`), the access key id the request was signed with, method, path with signatures
+  masked, status, bytes in and out, milliseconds, and how it was served: `pass` (from the bucket),
+  `compacted` (rebuilt from packs), `redirect`, `local` (health and metrics) or `rift` (rift's own
+  refusals and errors). rift's other messages go to stderr. With the chart: `--set accessLog=true`.
 - The log has a line for every compaction batch, garbage collection, and hot copy stubbed again.
 
 ## 9. Leaving

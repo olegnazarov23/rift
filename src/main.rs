@@ -166,6 +166,10 @@ struct GatewayArgs {
     /// Connections served at once; more are closed as they arrive
     #[arg(long, default_value_t = 1024)]
     max_connections: usize,
+    /// Write a JSON line per request to stdout: time, client address, access key id, method,
+    /// path (signatures masked), status, bytes, milliseconds and how it was served
+    #[arg(long)]
+    access_log: bool,
 }
 
 fn state_dir(given: &Option<std::path::PathBuf>, bucket: &str) -> std::path::PathBuf {
@@ -250,6 +254,7 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
         max_requests: args.max_requests,
         cold_reads: Arc::new(gateway::Slots::new(args.max_cold_reads)),
         spill: Arc::new(gateway::Slots::new(args.max_spill_gb << 30)),
+        access_log: args.access_log,
     })
     .serve(
         &args.listen,

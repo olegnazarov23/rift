@@ -55,6 +55,9 @@ spec:
             - --max-spill-gb={{ .Values.limits.maxSpillGB }}
             - --client-timeout-secs={{ .Values.limits.clientTimeoutSecs }}
             - --max-connections={{ .Values.limits.maxConnections }}
+            {{- if .Values.accessLog }}
+            - --access-log
+            {{- end }}
             {{- if .Values.tls.secretName }}
             - --tls-cert=/etc/rift/tls/tls.crt
             - --tls-key=/etc/rift/tls/tls.key

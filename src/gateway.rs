@@ -43,6 +43,8 @@ pub struct Gateway {
     pub cold_reads: Arc<Slots>,
     /// bytes of temp disk for rebuilt blobs waiting on their clients
     pub spill: Arc<Slots>,
+    /// write a JSON line per request to stdout
+    pub access_log: bool,
 }
 
 /// A counting semaphore over units (rebuilds, bytes): waits up to a limit for them to be free.
@@ -139,13 +141,35 @@ fn sized<R: Read>(status: StatusCode, headers: Vec<Header>, body: R, len: Option
     if len.is_some() { r.with_chunked_threshold(usize::MAX) } else { r }
 }
 
+thread_local! {
+    /// the response this thread last sent: status, length, how it was served (for the access log)
+    static SENT: std::cell::Cell<Option<(u16, Option<usize>, &'static str)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Sends a response and notes it for the access log. `served`: "pass" (from the bucket),
+/// "compacted" (rebuilt from packs), "redirect", "local" (health and metrics) or "rift" (rift's own
+/// answer: refusals and errors).
+fn send<R: Read>(req: Request, resp: Response<R>, served: &'static str) -> Result<()> {
+    SENT.with(|s| s.set(Some((resp.status_code().0, resp.data_length(), served))));
+    req.respond(resp)?;
+    Ok(())
+}
+
+/// The access key a request was signed with, from its Authorization header or presigned query.
+fn access_key_id(authorization: Option<&str>, query: &str) -> Option<String> {
+    let id = |credential: &str| credential.split('/').next().filter(|k| !k.is_empty()).map(str::to_string);
+    authorization
+        .and_then(|a| a.split("Credential=").nth(1))
+        .and_then(id)
+        .or_else(|| parse_query(query).into_iter().find(|(k, _)| k == "X-Amz-Credential").and_then(|(_, v)| id(&v)))
+}
+
 fn error(req: Request, status: u16, code: &str, message: &str) -> Result<()> {
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{code}</Code><Message>{}</Message></Error>",
         xml_escape(message)
     );
-    req.respond(Response::from_data(body).with_status_code(status).with_header(h("content-type", "application/xml")))?;
-    Ok(())
+    send(req, Response::from_data(body).with_status_code(status).with_header(h("content-type", "application/xml")), "rift")
 }
 
 /// Request headers worth passing to the backing store.
@@ -388,14 +412,38 @@ impl Gateway {
     }
 
     fn handle(&self, req: Request) {
+        let started = std::time::Instant::now();
         let method = req.method().as_str().to_string();
         let url = req.url().to_string();
+        let header = |name: &'static str| req.headers().iter().find(|x| x.field.equiv(name)).map(|x| x.value.as_str().to_string());
+        let (remote, forwarded_for) = (req.remote_addr().map(|a| a.ip().to_string()), header("x-forwarded-for"));
+        let key_id = access_key_id(header("authorization").as_deref(), url.split_once('?').map_or("", |(_, q)| q));
+        let bytes_in = req.body_length();
         if std::env::var_os("RIFT_DEBUG").is_some() {
             let hs: Vec<String> = req.headers().iter().map(|x| format!("{}: {}", x.field, redact(x.value.as_str()))).collect();
             eprintln!("rift: debug: {method} {} [{}]", redact(&url), hs.join("; "));
         }
+        SENT.with(|s| s.set(None));
         if let Err(e) = self.route(req, &method, &url) {
-            eprintln!("rift: {method} {url}: {e:#}");
+            eprintln!("rift: {method} {}: {e:#}", redact(&url));
+        }
+        if self.access_log {
+            // no response: the request failed, or the client went away, before one was sent
+            let (status, bytes_out, served) = SENT.with(|s| s.take()).unwrap_or((0, None, "none"));
+            let line = serde_json::json!({
+                "time": s3::iso(unix_now()),
+                "remote": remote,
+                "forwarded_for": forwarded_for,
+                "key_id": key_id,
+                "method": method,
+                "path": redact(&url),
+                "status": status,
+                "bytes_in": bytes_in,
+                "bytes_out": bytes_out,
+                "ms": started.elapsed().as_millis() as u64,
+                "served": served,
+            });
+            println!("{line}");
         }
     }
 
@@ -404,13 +452,11 @@ impl Gateway {
         // no bucket name can start with '-'
         if raw_path == "/-/metrics" {
             let out = Response::from_data(crate::metrics::render());
-            req.respond(out.with_header(h("content-type", "text/plain; version=0.0.4")))?;
-            return Ok(());
+            return send(req, out.with_header(h("content-type", "text/plain; version=0.0.4")), "local");
         }
         if raw_path == "/-/healthz" {
             let body = format!("{{\"status\":\"ok\",\"compacted\":{}}}\n", self.store.len());
-            req.respond(Response::from_data(body).with_header(h("content-type", "application/json")))?;
-            return Ok(());
+            return send(req, Response::from_data(body).with_header(h("content-type", "application/json")), "local");
         }
         let headers: Vec<(String, String)> = req
             .headers()
@@ -560,7 +606,7 @@ impl Gateway {
                 for x in back {
                     out.add_header(x);
                 }
-                req.respond(out)?;
+                send(req, out, "pass")?;
                 return Ok(());
             }
             After::Forget(keys) if ok => keys.iter().for_each(|k| self.store.forget(k)),
@@ -570,7 +616,7 @@ impl Gateway {
         if std::env::var_os("RIFT_DEBUG").is_some() {
             eprintln!("rift: debug: -> {status} content-length {len:?}");
         }
-        req.respond(sized(StatusCode(status), back, resp, len))?;
+        send(req, sized(StatusCode(status), back, resp, len), "pass")?;
         Ok(())
     }
 
@@ -592,7 +638,7 @@ impl Gateway {
         let status = StatusCode(if partial { 206 } else { 200 });
         let len = Some((end - start) as usize);
         if method == "HEAD" {
-            req.respond(sized(status, headers, io::empty(), len))?;
+            send(req, sized(status, headers, io::empty(), len), "compacted")?;
             return Ok(());
         }
         let Some(reserved) = self.spill.take(end - start, Duration::from_secs(60)) else {
@@ -653,7 +699,7 @@ impl Gateway {
                 }
             }
         });
-        req.respond(sized(status, headers, reader, len))?;
+        send(req, sized(status, headers, reader, len), "compacted")?;
         Ok(())
     }
 
@@ -661,7 +707,7 @@ impl Gateway {
         match self.store.backend.presign_get(key, endpoint, 900) {
             Ok(url) => {
                 add(&METRICS.redirects, 1);
-                req.respond(Response::empty(307).with_header(h("location", &url)))?;
+                send(req, Response::empty(307).with_header(h("location", &url)), "redirect")?;
                 Ok(())
             }
             Err(e) => error(req, 500, "InternalError", &format!("{e:#}")),
@@ -706,7 +752,7 @@ impl Gateway {
                 s3::iso(unix_now()),
                 xml_escape(&etag)
             );
-            req.respond(Response::from_data(xml).with_header(h("content-type", "application/xml")))?;
+            send(req, Response::from_data(xml).with_header(h("content-type", "application/xml")), "compacted")?;
             return Ok(());
         }
         // the source names the backing bucket
@@ -1070,6 +1116,16 @@ mod tests {
         let body = client.get(format!("https://localhost:{}/", addr.port())).send().unwrap().text().unwrap();
         assert_eq!(body, "ok");
         answer.join().unwrap();
+    }
+
+    #[test]
+    fn access_key_ids() {
+        let auth = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261109/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abc";
+        assert_eq!(access_key_id(Some(auth), "").as_deref(), Some("AKIDEXAMPLE"));
+        let presigned = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=riftclient%2F20261109%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=abc";
+        assert_eq!(access_key_id(None, presigned).as_deref(), Some("riftclient"));
+        assert_eq!(access_key_id(None, "list-type=2"), None);
+        assert_eq!(access_key_id(Some("Bearer x"), ""), None);
     }
 
     #[test]

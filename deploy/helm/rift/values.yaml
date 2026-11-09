@@ -73,6 +73,10 @@ limits:
   clientTimeoutSecs: 60
   maxConnections: 1024
 
+# A JSON line per request on stdout (who, what, status, bytes, how it was served). Off by default:
+# a busy registry makes many requests, and log pipelines often bill by volume.
+accessLog: false
+
 # Serve HTTPS from a kubernetes.io/tls Secret (kubectl create secret tls rift-tls --cert=… --key=…);
 # then the registry uses https://<service>:9100 with secure: true.
 tls:
