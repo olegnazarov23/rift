@@ -33,6 +33,9 @@ compaction:
   packLevel: 19
   # put a blob's original bytes back after a cold read, until it goes cold again
   hotCopy: true
+  # the most a blob may unpack to; compaction peaks near 2.5x this plus ~135 MB per thread, so
+  # 2048 with 4 threads fits the 8Gi limit below. Bigger blobs are left as they are.
+  maxUnpackedMB: 2048
 
 gc:
   # how long a pack no blob uses stays readable before it's deleted
@@ -47,8 +50,9 @@ serviceAccount:
   name: ""
   annotations: {}
 
-# Cold reads rebuild on these cores; compaction uses them too.
-threads: ""
+# Cold reads rebuild on these cores; compaction uses them too. Each adds ~135 MB while compacting.
+# Leave it set: without a CPU limit, rift would otherwise use every core on the node.
+threads: "4"
 resources:
   requests:
     cpu: "2"

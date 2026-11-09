@@ -17,7 +17,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, ensure};
 use fastcdc::v2020::FastCDC;
-use preflate_rs::{IndependentRecipe, PreflateConfig, RebuiltGroup, Splicer, preflate_independent};
+use preflate_rs::{ExitCode, IndependentRecipe, PreflateConfig, RebuiltGroup, Splicer, preflate_independent};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zstd::stream::raw::CParameter;
@@ -36,6 +36,11 @@ const PACK_BYTES: usize = 16 << 20;
 const PACKS: &str = ".rift/packs/";
 const MANIFESTS: &str = ".rift/m/";
 const MAGIC: &[u8; 8] = b"riftman1";
+/// A blob may unpack to at most this many times its size. Real layers come in well under it; a
+/// deflate bomb (up to ~1000x) doesn't.
+pub const MAX_RATIO: u64 = 100;
+/// Compactions of one blob that may die (rift killed, say out of memory) before it's left as it is.
+const MAX_TRIES: u64 = 2;
 
 
 pub struct Manifest {
@@ -208,22 +213,48 @@ fn parallel<R: Send>(n: usize, threads: usize, f: impl Fn(usize) -> R + Sync) ->
     out.into_iter().map(|m| m.into_inner().unwrap().expect("every index ran")).collect()
 }
 
-/// Unpacks a single-member gzip blob. Returns the manifest without chunk refs or group positions
-/// (`end` holds just the gzip trailer until `complete`) and the plain text, or None when the blob
-/// isn't gzip preflate can take.
-pub fn analyze(key: &str, digest: &str, mtime: u64, data: &[u8], threads: usize) -> Result<Option<(Manifest, Vec<u8>)>> {
-    let Some(start) = gzip_payload_offset(data) else { return Ok(None) };
-    let config = PreflateConfig { max_chain_length: 4096, plain_text_limit: 4 << 30, verify_compression: false };
-    let Ok((raw, deflate_len, plain)) = preflate_independent(&data[start..], &config, GROUP_PLAIN, threads) else {
-        return Ok(None);
+/// What `analyze` made of a blob.
+pub enum Unpacked {
+    /// the manifest, without chunk refs or group positions (`end` holds just the gzip trailer
+    /// until `complete`), and the plain text
+    Done(Manifest, Vec<u8>),
+    /// not gzip that preflate can rebuild byte-exact
+    Not,
+    /// it unpacks to more than the limit
+    TooBig,
+}
+
+/// Unpacks a single-member gzip blob, stopping once the plain text passes `limit` bytes.
+pub fn analyze(key: &str, digest: &str, mtime: u64, data: &[u8], threads: usize, limit: usize) -> Result<Unpacked> {
+    let Some(start) = gzip_payload_offset(data) else { return Ok(Unpacked::Not) };
+    let config = PreflateConfig { max_chain_length: 4096, plain_text_limit: limit, verify_compression: false };
+    let (raw, deflate_len, plain) = match preflate_independent(&data[start..], &config, GROUP_PLAIN, threads) {
+        Ok(r) => r,
+        Err(e) if e.exit_code() == ExitCode::PlainTextLimit => return Ok(Unpacked::TooBig),
+        Err(_) => return Ok(Unpacked::Not),
     };
     if start + deflate_len + 8 != data.len() {
-        return Ok(None);
+        return Ok(Unpacked::Not);
     }
     let trailer = data[start + deflate_len..].to_vec();
     let recipe = zstd::bulk::compress(&raw, 19)?;
     let m = Manifest::new(key.into(), data.len() as u64, digest.into(), mtime, data[..start].to_vec(), trailer, Vec::new(), Vec::new(), recipe);
-    Ok(Some((m, plain)))
+    Ok(Unpacked::Done(m, plain))
+}
+
+/// Blobs left as they are, with the ETag of the version that was tried ("*": any version), so
+/// they aren't downloaded and tried again every round.
+#[derive(Default)]
+pub struct Kept(Mutex<HashMap<String, String>>);
+
+impl Kept {
+    fn add(&self, key: &str, etag: &str) {
+        self.0.lock().unwrap().insert(key.to_string(), etag.trim_matches('"').to_string());
+    }
+
+    fn has(&self, key: &str, etag: &str) -> bool {
+        self.0.lock().unwrap().get(key).is_some_and(|e| e == "*" || e == etag.trim_matches('"'))
+    }
 }
 
 /// Rebuilds the blob from its chunks, records where each group's bytes land and checks the result
@@ -626,6 +657,10 @@ pub struct BlobInfo {
 /// The compacted blobs of one bucket.
 pub struct Store {
     pub backend: Arc<Backend>,
+    index: Arc<Index>,
+    /// the most a blob may unpack to for compaction; it holds the blob and its plain text in memory
+    pub max_unpacked: u64,
+    kept: Kept,
     cache: PackCache,
     /// every compacted blob; listing the manifests' names rebuilds this
     compacted: RwLock<HashMap<String, BlobInfo>>,
@@ -737,6 +772,9 @@ impl Store {
         }
         Ok(Self {
             backend,
+            index: index.clone(),
+            max_unpacked: 2 << 30,
+            kept: Kept::default(),
             cache: PackCache::new(cache_packs),
             compacted: RwLock::new(compacted),
             manifests: ManifestCache::new(manifest_cache),
@@ -1059,22 +1097,49 @@ impl Store {
         Ok(())
     }
 
+    /// Leaves a blob as it is from now on (`etag` "*": whatever its version), saying why once.
+    pub fn keep(&self, key: &str, etag: &str, why: &str) {
+        eprintln!("rift: {key}: {why}; kept as is");
+        self.kept.add(key, etag);
+    }
+
+    /// Whether this version of the blob is being left as it is.
+    pub fn is_kept(&self, key: &str, etag: &str) -> bool {
+        self.kept.has(key, etag)
+    }
+
     /// Compacts the given blobs (key, sha256, last-modified); returns how many were compacted and
-    /// the bytes they took before and after (packs counted as they grow).
+    /// the bytes they took before and after (packs counted as they grow). A blob that can't be
+    /// compacted, or that unpacks past `max_unpacked` or MAX_RATIO times its size, is kept as is.
     pub fn compact(&self, blobs: &[(String, String, u64)], threads: usize) -> (usize, u64) {
         let mut ready = Vec::new();
         for (key, digest, mtime) in blobs {
-            let attempt = (|| -> Result<Option<(Manifest, String)>> {
+            // counted on disk first: a blob that keeps taking rift down isn't tried forever
+            if self.index.begin_attempt(key).unwrap_or(1) > MAX_TRIES {
+                self.keep(key, "*", &format!("rift stopped {MAX_TRIES} times while compacting it"));
+                continue;
+            }
+            let attempt = (|| -> Result<std::result::Result<(Manifest, String), (String, String)>> {
                 let (data, etag) = self.backend.get(key)?;
-                ensure!(sha256_hex(&data) == *digest, "content doesn't match its digest");
-                let Some((mut m, plain)) = analyze(key, digest, *mtime, &data, threads)? else { return Ok(None) };
-                let refs = self.packer.lock().unwrap().add(&plain, &|id, z, idx| self.store_pack(id, z, idx))?;
-                m.set_refs(refs);
-                Ok(Some((m, etag)))
+                if sha256_hex(&data) != *digest {
+                    return Ok(Err((etag, "content doesn't match its digest".into())));
+                }
+                let limit = self.max_unpacked.min(data.len() as u64 * MAX_RATIO);
+                match analyze(key, digest, *mtime, &data, threads, limit as usize)? {
+                    Unpacked::Done(mut m, plain) => {
+                        let refs = self.packer.lock().unwrap().add(&plain, &|id, z, idx| self.store_pack(id, z, idx))?;
+                        m.set_refs(refs);
+                        Ok(Ok((m, etag)))
+                    }
+                    Unpacked::Not => Ok(Err((etag, "not rebuildable byte-exact".into()))),
+                    Unpacked::TooBig => Ok(Err((etag, format!("unpacks to more than {} MB", limit.div_ceil(1 << 20))))),
+                }
             })();
+            let _ = self.index.end_attempt(key);
             match attempt {
-                Ok(Some(r)) => ready.push(r),
-                Ok(None) => eprintln!("rift: {key}: not rebuildable byte-exact, kept as is"),
+                Ok(Ok(r)) => ready.push(r),
+                Ok(Err((etag, why))) => self.keep(key, &etag, &why),
+                // e.g. the bucket didn't answer: tried again next round
                 Err(e) => eprintln!("rift: {key}: {e:#}"),
             }
         }
@@ -1153,6 +1218,28 @@ mod tests {
 
     // Compaction into packs, then every range served by the streaming rebuild matches the original.
     #[test]
+    fn stops_unpacking_bombs() {
+        // 64 MB of zeros gzips to about 64 KB: over a hundred times smaller than it unpacks
+        let blob = gzip(&vec![0u8; 64 << 20]);
+        let digest = sha256_hex(&blob);
+        let limit = blob.len() * MAX_RATIO as usize;
+        assert!(matches!(analyze("k", &digest, 0, &blob, 2, limit).unwrap(), Unpacked::TooBig));
+        assert!(matches!(analyze("k", &digest, 0, &blob, 2, 65 << 20).unwrap(), Unpacked::Done(..)), "under the limit it's fine");
+        assert!(matches!(analyze("k", &digest, 0, b"not gzip", 2, limit).unwrap(), Unpacked::Not));
+    }
+
+    #[test]
+    fn kept_blobs_by_version() {
+        let kept = Kept::default();
+        kept.add("a", "\"abc\"");
+        assert!(kept.has("a", "abc") && kept.has("a", "\"abc\""), "quotes or not");
+        assert!(!kept.has("a", "def"), "a new version is tried again");
+        kept.add("b", "*");
+        assert!(kept.has("b", "anything"));
+        assert!(!kept.has("c", "abc"));
+    }
+
+    #[test]
     fn compact_and_stream_ranges() {
         let mut text = Vec::new();
         for i in 0..400_000u32 {
@@ -1160,7 +1247,7 @@ mod tests {
         }
         let blob = gzip(&text);
         let digest = sha256_hex(&blob);
-        let (mut m, plain) = analyze("k", &digest, 0, &blob, 4).unwrap().expect("preflate takes it");
+        let Unpacked::Done(mut m, plain) = analyze("k", &digest, 0, &blob, 4, usize::MAX).unwrap() else { panic!("preflate takes it") };
         let packs: Mutex<HashMap<u32, Arc<Vec<u8>>>> = Mutex::new(HashMap::new());
         let dir = std::env::temp_dir().join(format!("rift-cas-test-{}", std::process::id()));
         let index = Arc::new(Index::open(&dir.join("index.redb")).unwrap());

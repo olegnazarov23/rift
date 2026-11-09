@@ -21,8 +21,10 @@ On our tests: 64% less on official Docker Hub images, 79% on 30 consecutive CI b
 - The bucket, and access to it for rift: an IAM role (IRSA, EKS Pod Identity, ECS task role or
   EC2 instance profile) or a key, with the policy below. rift keeps its data in the same bucket,
   under `.rift/`.
-- Somewhere to run rift next to the registry, in the bucket's region: 2 or more cores, 4–8 GB of
-  memory, temp space for your largest layer, and local disk for the chunk index (about 60 bytes per
+- Somewhere to run rift next to the registry, in the bucket's region: 2 or more cores; memory for
+  compaction, which peaks near 2.5 times the largest unpacked blob it takes on (`--max-unpacked-mb`,
+  default 2048) plus about 135 MB per thread, so 8 GB for the defaults with 4 threads; temp space for
+  your largest layer, and local disk for the chunk index (about 60 bytes per
   stored chunk, roughly 1 GB per TB stored). The index is rebuilt from the bucket if it's lost; keep
   it on a persistent volume (`state.persistence.enabled` in the chart) to skip that on restarts.
 
@@ -143,6 +145,13 @@ endpoint as well as the registry.
 | `--max-requests` | 512 | requests in flight |
 | `--max-cold-reads` | 4 | rebuilds at once; more wait up to a minute |
 | `--max-spill-gb` | 16 | temp disk for rebuilt blobs waiting on slow clients; keep it under the temp volume (the chart's `/tmp` is 20Gi) |
+| `--max-unpacked-mb` | 2048 | memory for unpacking one blob during compaction |
+
+rift unpacks layers to compact them, which a registry never does, so a pushed layer could be a
+deflate bomb (a few MB that unpack to gigabytes). Compaction stops unpacking at `--max-unpacked-mb`
+or at 100 times the blob's size, whichever is less, and leaves such blobs as they are. A blob that
+rift stopped twice while compacting (killed for memory, say) is left as it is too, so it can't
+crash rift over and over. Blobs left as they are aren't downloaded and tried again on every round.
 
 A rebuild writes to a temp file as fast as it can and the client reads it at its own pace, so a slow
 download holds temp disk, never a rebuild slot. Temp files a killed rift leaves behind are deleted
@@ -219,6 +228,8 @@ network: signatures stop tampering and replays, but blob contents cross the netw
 - A cold pull of a big layer on few cores is slower than a plain download, about 2–3× on 6 cores.
 - gzip layers only; zstd and eStargz layers are left as they are.
 - No timeout for clients that connect and stall mid-request (see Security).
+- Blobs that unpack to more than `--max-unpacked-mb` stay as they are, so the biggest layers of ML
+  images may not be compacted at the default.
 - Tested end to end with distribution 2.8.3, Harbor 2.14.6 and GitLab's registry 4.41 (both
   metadata modes) on MinIO, and with distribution and GitLab's registry (metadata database, default
   checksums) on AWS S3 in us-east-1, driven from a laptop. Not yet run in-region at scale.

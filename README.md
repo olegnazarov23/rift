@@ -92,7 +92,7 @@ an AWS role: IRSA, EKS Pod Identity, ECS task roles or EC2 instance profiles.
 - Every request must be signed with the client keys within 15 minutes of rift's clock; bodies are
   checked against their signed hash, chunk signatures and checksums. `--tls-cert`/`--tls-key` serve
   HTTPS. `--max-body-mb`, `--max-requests`, `--max-cold-reads` and `--max-spill-gb` bound what one
-  client can take (details in [docs/PILOT.md](docs/PILOT.md#5-security)).
+  client can take; compaction stops unpacking deflate bombs (`--max-unpacked-mb`, 100× ratio) (details in [docs/PILOT.md](docs/PILOT.md#5-security)).
 
 Running it for a pilot (Docker, Helm, registry settings, leaving): [docs/PILOT.md](docs/PILOT.md).
 Not done yet: more than one gateway per bucket.

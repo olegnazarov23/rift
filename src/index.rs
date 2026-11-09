@@ -15,6 +15,8 @@ const CHUNKS: TableDefinition<[u8; 32], (u32, u32, u32)> = TableDefinition::new(
 /// stored size, bytes of chunks
 const PACKS: TableDefinition<u32, (u64, u64)> = TableDefinition::new("packs");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+/// compactions started and not finished, by blob key
+const ATTEMPTS: TableDefinition<&str, u64> = TableDefinition::new("attempts");
 const VERSION: u64 = 1;
 
 pub struct Index {
@@ -98,6 +100,27 @@ impl Index {
         Ok(())
     }
 
+    /// Counts a compaction of `key` starting; returns how many have started without finishing.
+    pub fn begin_attempt(&self, key: &str) -> Result<u64> {
+        let w = self.db.begin_write()?;
+        let n = {
+            let mut t = w.open_table(ATTEMPTS)?;
+            let n = t.get(key)?.map_or(0, |v| v.value()) + 1;
+            t.insert(key, n)?;
+            n
+        };
+        w.commit()?;
+        Ok(n)
+    }
+
+    /// The compaction of `key` finished, however it went.
+    pub fn end_attempt(&self, key: &str) -> Result<()> {
+        let w = self.db.begin_write()?;
+        w.open_table(ATTEMPTS)?.remove(key)?;
+        w.commit()?;
+        Ok(())
+    }
+
     /// Forgets packs, and their chunks unless those now point somewhere else.
     pub fn remove_packs(&self, packs: &[(u32, Vec<Entry>)]) -> Result<()> {
         let w = self.db.begin_write()?;
@@ -139,6 +162,11 @@ mod tests {
         assert_eq!(index.lookup(&b).unwrap(), Some([1, 0, 20]));
         assert_eq!(index.packs().unwrap().keys().copied().collect::<Vec<_>>(), vec![1]);
         index.rebuild([(7, 9, vec![(a, 0, 10)])]).unwrap();
+        // attempts survive a rebuild, and count until one finishes
+        assert_eq!(index.begin_attempt("k").unwrap(), 1);
+        assert_eq!(index.begin_attempt("k").unwrap(), 2);
+        index.end_attempt("k").unwrap();
+        assert_eq!(index.begin_attempt("k").unwrap(), 1);
         assert_eq!(index.lookup(&b).unwrap(), None);
         assert_eq!(index.lookup(&a).unwrap(), Some([7, 0, 10]));
         drop(index);

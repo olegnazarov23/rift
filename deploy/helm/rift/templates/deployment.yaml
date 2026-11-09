@@ -45,6 +45,7 @@ spec:
             - --interval={{ .Values.compaction.interval }}
             - --min-size-mb={{ .Values.compaction.minSizeMB }}
             - --pack-level={{ .Values.compaction.packLevel }}
+            - --max-unpacked-mb={{ .Values.compaction.maxUnpackedMB }}
             - --gc-grace={{ .Values.gc.grace }}
             - --gc-rewrite-below={{ .Values.gc.rewriteBelow }}
             - --state-dir=/var/lib/rift

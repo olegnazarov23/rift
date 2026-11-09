@@ -154,6 +154,11 @@ struct GatewayArgs {
     /// Temp disk for rebuilt blobs waiting on slow clients, in GB; keep it under the temp dir's size
     #[arg(long, default_value_t = 16)]
     max_spill_gb: u64,
+    /// The most a blob may unpack to for compaction, in MB. Compaction peaks near 2.5 times this,
+    /// plus about 135 MB per thread. Bigger blobs, and blobs that unpack to over 100 times their
+    /// size, are left as they are
+    #[arg(long, default_value_t = 2048)]
+    max_unpacked_mb: u64,
 }
 
 fn state_dir(given: &Option<std::path::PathBuf>, bucket: &str) -> std::path::PathBuf {
@@ -186,7 +191,9 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
     }
     let threads = args.threads.unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
     let dir = state_dir(&args.state_dir, bucket);
-    let store = Arc::new(cas::Store::open(Arc::new(backend), &dir, args.pack_level, 64, threads, args.manifest_cache_mb << 20)?);
+    let mut store = cas::Store::open(Arc::new(backend), &dir, args.pack_level, 64, threads, args.manifest_cache_mb << 20)?;
+    store.max_unpacked = args.max_unpacked_mb << 20;
+    let store = Arc::new(store);
     eprintln!(
         "rift gateway on {}{} for {}/{bucket}: {} compacted blobs, compacting after {} cold (looking every {}), client signatures {}, bucket keys from {}",
         if args.tls_cert.is_some() { "https://" } else { "" },

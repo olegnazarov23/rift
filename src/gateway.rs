@@ -787,7 +787,14 @@ pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, s: 
                             }
                         }
                         Some(_) => {}
-                        None if o.size >= s.min_size && idle => cold.push((o.key, digest, o.modified)),
+                        None if o.size >= s.min_size && idle && !store.is_kept(&o.key, &o.etag) => {
+                            if o.size > store.max_unpacked {
+                                store.keep(&o.key, &o.etag, &format!("{} MB, over --max-unpacked-mb", o.size >> 20));
+                                add(&METRICS.compaction_failures, 1);
+                            } else {
+                                cold.push((o.key, digest, o.modified));
+                            }
+                        }
                         None => {}
                     }
                 }
