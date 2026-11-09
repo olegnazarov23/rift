@@ -89,6 +89,10 @@ impl Registry {
         query.push(("scope", field("scope").unwrap_or(format!("repository:{}:pull", self.repo))));
         let mut req = self.client.get(&realm).query(&query);
         if let (Ok(user), Ok(pass)) = (std::env::var("RIFT_REGISTRY_USER"), std::env::var("RIFT_REGISTRY_PASSWORD")) {
+            // the registry names the token service, so it could name one that reads the password in transit
+            if !realm.starts_with("https://") {
+                bail!("the registry's token service {realm} isn't HTTPS; not sending RIFT_REGISTRY_PASSWORD to it");
+            }
             req = req.basic_auth(user, Some(pass));
         }
         let body: Value = serde_json::from_str(&req.send()?.error_for_status()?.text()?)?;

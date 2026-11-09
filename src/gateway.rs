@@ -107,6 +107,36 @@ fn redact(s: &str) -> String {
     out
 }
 
+/// Query parameters that hold secrets, masked in logs.
+const SECRET_PARAMS: &[&str] = &["X-Amz-Signature", "X-Amz-Security-Token"];
+
+/// A request target fit for a log line: secret parameters masked by their decoded names (as rift
+/// reads them, so "X-Amz-%53ignature" too) and control characters escaped.
+fn loggable_url(url: &str) -> String {
+    let Some((path, query)) = url.split_once('?') else { return printable(url) };
+    let masked: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((k, _)) if SECRET_PARAMS.iter().any(|s| uri_decode(k).eq_ignore_ascii_case(s)) => format!("{k}=…"),
+            _ => pair.to_string(),
+        })
+        .collect();
+    printable(&format!("{path}?{}", masked.join("&")))
+}
+
+/// Control characters escaped, so what a client sends can't forge or garble log lines.
+fn printable(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Query parameters that only carry a presigned URL's signature.
 const PRESIGN_PARAMS: &[&str] = &[
     "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires", "X-Amz-SignedHeaders",
@@ -236,6 +266,13 @@ fn access_key_id(authorization: Option<&str>, query: &str) -> Option<String> {
         .or_else(|| parse_query(query).into_iter().find(|(k, _)| k == "X-Amz-Credential").and_then(|(_, v)| id(&v)))
 }
 
+/// A failure on rift's side: the client gets `what`, the log gets the details (they can name the
+/// backend and quote its errors).
+fn failed(req: Request, status: u16, code: &str, what: &str, key: &str, e: &anyhow::Error) -> Result<()> {
+    eprintln!("rift: {what} ({}): {}", printable(key), printable(&format!("{e:#}")));
+    error(req, status, code, what)
+}
+
 fn error(req: Request, status: u16, code: &str, message: &str) -> Result<()> {
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{code}</Code><Message>{}</Message></Error>",
@@ -346,7 +383,7 @@ fn parse_range(r: &str, size: u64) -> Option<(u64, u64)> {
         (size.saturating_sub(b.parse().ok()?), size)
     } else {
         let s: u64 = a.parse().ok()?;
-        (s, if b.is_empty() { size } else { (b.parse::<u64>().ok()? + 1).min(size) })
+        (s, if b.is_empty() { size } else { b.parse::<u64>().ok()?.saturating_add(1).min(size) })
     };
     (start < end).then_some((start, end))
 }
@@ -512,12 +549,19 @@ impl Gateway {
         let key_id = access_key_id(header("authorization").as_deref(), url.split_once('?').map_or("", |(_, q)| q));
         let bytes_in = req.body_length();
         if std::env::var_os("RIFT_DEBUG").is_some() {
-            let hs: Vec<String> = req.headers().iter().map(|x| format!("{}: {}", x.field, redact(x.value.as_str()))).collect();
-            eprintln!("rift: debug: {method} {} [{}]", redact(&url), hs.join("; "));
+            let hs: Vec<String> = req
+                .headers()
+                .iter()
+                .map(|x| match x.field.equiv("x-amz-security-token") {
+                    true => format!("{}: …", x.field),
+                    false => printable(&format!("{}: {}", x.field, redact(x.value.as_str()))),
+                })
+                .collect();
+            eprintln!("rift: debug: {method} {} [{}]", loggable_url(&url), hs.join("; "));
         }
         SENT.with(|s| s.set(None));
         if let Err(e) = self.route(req, &method, &url) {
-            eprintln!("rift: {method} {}: {e:#}", redact(&url));
+            eprintln!("rift: {method} {}: {}", loggable_url(&url), printable(&format!("{e:#}")));
         }
         if self.access_log {
             // no response: the request failed, or the client went away, before one was sent
@@ -528,7 +572,7 @@ impl Gateway {
                 "forwarded_for": forwarded_for,
                 "key_id": key_id,
                 "method": method,
-                "path": redact(&url),
+                "path": loggable_url(&url),
                 "status": status,
                 "bytes_in": bytes_in,
                 "bytes_out": bytes_out,
@@ -637,7 +681,7 @@ impl Gateway {
                     Some(_) if !self.store.is_hot(&key) => match self.store.manifest(&key) {
                         Ok(Some(m)) => self.serve_compacted(req, method, &m, header("range"), &overrides),
                         Ok(None) => self.forward(req, method, &key, &query, &headers, After::Nothing, seed),
-                        Err(e) => error(req, 500, "InternalError", &format!("loading the manifest: {e:#}")),
+                        Err(e) => failed(req, 500, "InternalError", "couldn't load the blob's manifest", &key, &e),
                     },
                     // stored as it is: a client following a presigned URL fetches it from the backend directly
                     _ => match &self.redirect {
@@ -716,7 +760,7 @@ impl Gateway {
             Ok(r) => r,
             Err(e) => {
                 add(&METRICS.backend_errors, 1);
-                return error(req, 502, "BadGateway", &format!("{e:#}"));
+                return failed(req, 502, "BadGateway", "the bucket didn't answer", key, &e);
             }
         };
         let status = resp.status().as_u16();
@@ -858,7 +902,7 @@ impl Gateway {
                 send(req, Response::empty(307).with_header(h("location", &url)), "redirect")?;
                 Ok(())
             }
-            Err(e) => error(req, 500, "InternalError", &format!("{e:#}")),
+            Err(e) => failed(req, 500, "InternalError", "couldn't presign the redirect", key, &e),
         }
     }
 
@@ -876,7 +920,7 @@ impl Gateway {
         let part = query.iter().any(|(k, _)| k == "partNumber");
         let source_manifest = match self.store.manifest(src_key) {
             Ok(m) => m,
-            Err(e) => return error(req, 500, "InternalError", &format!("loading the manifest: {e:#}")),
+            Err(e) => return failed(req, 500, "InternalError", "couldn't load the source's manifest", src_key, &e),
         };
         if let Some(m) = source_manifest {
             if part {
@@ -1086,6 +1130,7 @@ mod tests {
             let _ = rewrite_list(&t, &|k| (k.len() % 2 == 0).then_some((1, 2)));
             let _ = parse_range(&t, rng.next() % 1000);
             let _ = redact(&t);
+            let _ = loggable_url(&t);
             let header = |h: &str| (h == "x-amz-date").then(|| t.clone());
             let _ = sigv4::verify("AK", "SK", "GET", &t, &t, &t, &header);
             let _ = sigv4::verify_presigned("AK", "SK", "GET", &t, &t, &header);
@@ -1366,6 +1411,10 @@ mod tests {
     fn redacts_signatures() {
         assert_eq!(redact("Credential=AK/x, SignedHeaders=host, Signature=abc123"), "Credential=AK/x, SignedHeaders=host, Signature=…");
         assert_eq!(redact("/b/k?X-Amz-Date=1&X-Amz-Signature=deadbeef&x=1"), "/b/k?X-Amz-Date=1&X-Amz-Signature=…&x=1");
+        // by the names rift decodes, and with no way to forge a line
+        assert_eq!(loggable_url("/b/k?X-Amz-Date=1&X-Amz-%53ignature=deadbeef&x=1"), "/b/k?X-Amz-Date=1&X-Amz-%53ignature=…&x=1");
+        assert_eq!(loggable_url("/b/k?x-amz-security-token=t0ken&x=1"), "/b/k?x-amz-security-token=…&x=1");
+        assert_eq!(loggable_url("/b/k\r\nrift: forged\x1b[2J"), "/b/k\\r\\nrift: forged\\u{1b}[2J");
     }
 
     #[test]
@@ -1375,6 +1424,7 @@ mod tests {
         assert_eq!(parse_range("bytes=-3", 10), Some((7, 10)));
         assert_eq!(parse_range("bytes=5-100", 10), Some((5, 10)));
         assert_eq!(parse_range("bytes=10-", 10), None);
+        assert_eq!(parse_range("bytes=0-18446744073709551615", 10), Some((0, 10)), "no overflow");
     }
 
     #[test]

@@ -72,7 +72,7 @@ struct EjectArgs {
 fn eject(args: &EjectArgs) -> Result<()> {
     let backend = s3::Backend::new(&args.backend, &args.bucket, &args.region, creds::Credentials::from_env(&args.region)?)?;
     let threads = args.threads.unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
-    let store = cas::Store::open(Arc::new(backend), &state_dir(&args.state_dir, &args.bucket), 19, 64, threads, 64 << 20)?;
+    let store = cas::Store::open(Arc::new(backend), &state_dir(&args.state_dir, &args.bucket)?, 19, 64, threads, 64 << 20)?;
     if !args.yes {
         println!("{} compacted blobs in {}/{} would be put back as they were, then rift's packs deleted.", store.len(), args.backend, args.bucket);
         println!("Stop the gateway first, then run again with --yes.");
@@ -133,9 +133,13 @@ struct GatewayArgs {
     /// Memory for manifests loaded from the bucket, in MB
     #[arg(long, default_value_t = 512)]
     manifest_cache_mb: usize,
-    /// Where the chunk index lives (rebuilt from the bucket if lost); default: a temp directory
+    /// Where the chunk index lives (rebuilt from the bucket if lost); only rift's user should be
+    /// able to write there. Default: ~/.cache/rift/<bucket>
     #[arg(long)]
     state_dir: Option<std::path::PathBuf>,
+    /// Accept unsigned requests, without client keys; only on a loopback address
+    #[arg(long)]
+    no_client_auth: bool,
     /// Serve HTTPS with this certificate (PEM, with any intermediates)
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<std::path::PathBuf>,
@@ -172,8 +176,38 @@ struct GatewayArgs {
     access_log: bool,
 }
 
-fn state_dir(given: &Option<std::path::PathBuf>, bucket: &str) -> std::path::PathBuf {
-    given.clone().unwrap_or_else(|| std::env::temp_dir().join("rift").join(bucket))
+/// The given state dir, or one under the user's home: the temp dir is shared on most hosts, so
+/// another user could make the directory first and tamper with the index.
+fn state_dir(given: &Option<std::path::PathBuf>, bucket: &str) -> Result<std::path::PathBuf> {
+    if let Some(dir) = given {
+        return Ok(dir.clone());
+    }
+    let cache = match std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::path::PathBuf::from(std::env::var_os("HOME").filter(|v| !v.is_empty()).context("HOME isn't set; pass --state-dir")?)
+            .join(".cache"),
+    };
+    Ok(cache.join("rift").join(bucket))
+}
+
+/// The keys the registry signs with: both or neither, and a secret too long to guess.
+fn client_keys(access: Option<String>, secret: Option<String>) -> Result<Option<(String, String)>> {
+    let (access, secret) = (access.filter(|v| !v.is_empty()), secret.filter(|v| !v.is_empty()));
+    match (access, secret) {
+        (None, None) => Ok(None),
+        (Some(a), _) if a.contains(['/', ',', ' ']) => bail!("RIFT_CLIENT_ACCESS_KEY can't hold '/', ',' or spaces"),
+        (Some(_), Some(s)) if s.chars().count() < 16 => bail!("RIFT_CLIENT_SECRET_KEY needs at least 16 characters"),
+        (Some(a), Some(s)) => Ok(Some((a, s))),
+        _ => bail!("set both RIFT_CLIENT_ACCESS_KEY and RIFT_CLIENT_SECRET_KEY"),
+    }
+}
+
+/// Whether the listen address is loopback only: an IP address, not a name that could resolve anywhere.
+fn loopback(listen: &str) -> bool {
+    match listen.parse::<std::net::SocketAddr>() {
+        Ok(a) => a.ip().is_loopback(),
+        Err(_) => listen.rsplit_once(':').is_some_and(|(host, _)| host == "localhost"),
+    }
 }
 
 /// "30s", "10m", "12h", "7d" or plain seconds.
@@ -192,16 +226,15 @@ fn seconds(s: &str) -> Result<u64> {
 fn gateway(args: &GatewayArgs) -> Result<()> {
     let bucket = args.backend_bucket.as_deref().unwrap_or(&args.bucket);
     let backend = s3::Backend::new(&args.backend, bucket, &args.region, creds::Credentials::from_env(&args.region)?)?;
-    let client_keys = match (std::env::var("RIFT_CLIENT_ACCESS_KEY"), std::env::var("RIFT_CLIENT_SECRET_KEY")) {
-        (Ok(a), Ok(s)) => Some((a, s)),
-        _ => None,
-    };
-    let loopback = args.listen.starts_with("127.") || args.listen.starts_with("localhost:") || args.listen.starts_with("[::1]");
-    if client_keys.is_none() && !loopback {
-        bail!("set RIFT_CLIENT_ACCESS_KEY and RIFT_CLIENT_SECRET_KEY to listen beyond localhost");
+    let client_keys = client_keys(std::env::var("RIFT_CLIENT_ACCESS_KEY").ok(), std::env::var("RIFT_CLIENT_SECRET_KEY").ok())?;
+    match (&client_keys, args.no_client_auth) {
+        (None, false) => bail!("set RIFT_CLIENT_ACCESS_KEY and RIFT_CLIENT_SECRET_KEY, the keys the registry signs with (or pass --no-client-auth to accept unsigned requests on a loopback address)"),
+        (None, true) if !loopback(&args.listen) => bail!("--no-client-auth works only on a loopback address (127.0.0.1, [::1] or localhost)"),
+        (Some(_), true) => bail!("--no-client-auth with client keys set: drop one"),
+        _ => {}
     }
     let threads = args.threads.unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
-    let dir = state_dir(&args.state_dir, bucket);
+    let dir = state_dir(&args.state_dir, bucket)?;
     let mut store = cas::Store::open(Arc::new(backend), &dir, args.pack_level, 64, threads, args.manifest_cache_mb << 20)?;
     store.max_unpacked = args.max_unpacked_mb << 20;
     let store = Arc::new(store);
@@ -640,5 +673,33 @@ fn main() -> Result<()> {
         Cmd::Scan(args) => scan(&args),
         Cmd::Gateway(args) => gateway(&args),
         Cmd::Eject(args) => eject(&args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_key_rules() {
+        let s = |v: &str| Some(v.to_string());
+        assert!(client_keys(None, None).unwrap().is_none());
+        assert!(client_keys(s(""), s("")).unwrap().is_none(), "empty is unset");
+        assert!(client_keys(s("AK"), None).is_err());
+        assert!(client_keys(s("AK"), s("")).is_err(), "an empty secret isn't one");
+        assert!(client_keys(None, s("0123456789abcdef")).is_err());
+        assert!(client_keys(s("AK"), s("0123456789abcde")).is_err(), "15 characters");
+        assert!(client_keys(s("A/K"), s("0123456789abcdef")).is_err());
+        assert_eq!(client_keys(s("AK"), s("0123456789abcdef")).unwrap(), Some(("AK".into(), "0123456789abcdef".into())));
+    }
+
+    #[test]
+    fn loopback_addresses() {
+        for a in ["127.0.0.1:9100", "127.1.2.3:80", "[::1]:9100", "localhost:9100"] {
+            assert!(loopback(a), "{a}");
+        }
+        for a in ["0.0.0.0:9100", "10.0.0.1:9100", "[::]:9100", "127.example.com:9100", "localhost.example.com:9100"] {
+            assert!(!loopback(a), "{a}");
+        }
     }
 }
