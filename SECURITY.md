@@ -4,7 +4,8 @@ Please report vulnerabilities privately: on this repository's Security tab, choo
 "Report a vulnerability". Don't open a public issue for them.
 
 What rift checks on each request, its limits, and its known gaps are in
-[docs/PILOT.md](docs/PILOT.md#5-security).
+[docs/PILOT.md](docs/PILOT.md#5-security); the threats considered, with the control and evidence for
+each, are in [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md).
 
 ## Verifying a release
 

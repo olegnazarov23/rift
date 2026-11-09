@@ -122,5 +122,7 @@ in `deploy/helm/rift`.
 
 ## License
 
+Security: [threat model](docs/THREAT-MODEL.md).
+
 Apache-2.0, see [LICENSE](LICENSE). `vendor/preflate-rs` is Microsoft's preflate-rs, also
 Apache-2.0, with our changes ([NOTICE](NOTICE)). Security reports: [SECURITY.md](SECURITY.md).
