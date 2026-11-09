@@ -148,6 +148,12 @@ endpoint as well as the registry.
 | `--max-cold-reads` | 4 | rebuilds at once; more wait up to a minute |
 | `--max-spill-gb` | 16 | temp disk for rebuilt blobs waiting on slow clients; keep it under the temp volume (the chart's `/tmp` is 20Gi) |
 | `--max-unpacked-mb` | 2048 | memory for unpacking one blob during compaction |
+| `--client-timeout-secs` | 60 | how long a client may stall a read or write (the TLS handshake included), and may take to send a request's headers |
+| `--max-connections` | 1024 | connections served at once; more are closed as they arrive |
+
+Request headers are capped at 64 KB and 200 lines. A client that connects and stalls, or drips its
+headers (slowloris), is dropped after `--client-timeout-secs`, so it can hold a connection only that
+long; a flood past `--max-connections` is refused until those time out.
 
 rift unpacks layers to compact them, which a registry never does, so a pushed layer could be a
 deflate bomb (a few MB that unpack to gigabytes). Compaction stops unpacking at `--max-unpacked-mb`
@@ -173,9 +179,6 @@ network: signatures stop tampering and replays, but blob contents cross the netw
 - Only the registry needs to reach rift, plus the machines that pull if redirects are on (presigned
   URLs point at rift). Admit just those with a NetworkPolicy or security group; the limits above
   bound what anyone else could do.
-- The limits count requests, not connections. rift's HTTP server has no timeout for a client that
-  connects and then stalls before sending a whole request (slowloris). If anything untrusted can
-  reach rift, put a proxy or load balancer with client timeouts in front of it.
 - `/-/metrics` and `/-/healthz` answer without a signature (counts and sizes, no keys or names) on
   the same port; keep them inside too.
 - Encryption at rest is the bucket's: see Bucket settings below.
@@ -253,7 +256,6 @@ policy above.
   pushes are a small daily stream.
 - A cold pull of a big layer on few cores is slower than a plain download, about 2–3× on 6 cores.
 - gzip layers only; zstd and eStargz layers are left as they are.
-- No timeout for clients that connect and stall mid-request (see Security).
 - Blobs that unpack to more than `--max-unpacked-mb` stay as they are, so the biggest layers of ML
   images may not be compacted at the default.
 - Tested end to end with distribution 2.8.3, Harbor 2.14.6 and GitLab's registry 4.41 (both

@@ -1,3 +1,5 @@
+// Changed for rift: Limits and Server::from_listener_with_limits, and the accept loop keeps going
+// after errors; see vendor/tiny_http/README.md.
 //! # Simple usage
 //!
 //! ## Creating the server
@@ -169,6 +171,31 @@ pub struct IncomingRequests<'a> {
     server: &'a Server,
 }
 
+/// Limits that keep slow or hostile clients from tying the server up. `Default` is upstream
+/// tiny_http's behavior: none of them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Limits {
+    /// how long a socket read or write may wait, the TLS handshake included
+    pub idle_timeout: Option<std::time::Duration>,
+    /// how long a request's line and headers may take to arrive, from their first byte
+    pub header_timeout: Option<std::time::Duration>,
+    /// most bytes in a request's line and headers
+    pub max_header_bytes: Option<usize>,
+    /// most header lines in a request
+    pub max_headers: Option<usize>,
+    /// connections served at once; more are closed as they arrive
+    pub max_connections: Option<usize>,
+}
+
+/// Counts a connection as live until dropped.
+struct LiveConnection(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for LiveConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Relaxed);
+    }
+}
+
 /// Represents the parameters required to create a server.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -243,6 +270,15 @@ impl Server {
         listener: L,
         ssl_config: Option<SslConfig>,
     ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
+        Self::from_listener_with_limits(listener, ssl_config, Limits::default())
+    }
+
+    /// Like `from_listener`, with limits on slow clients, request headers and connections.
+    pub fn from_listener_with_limits<L: Into<Listener>>(
+        listener: L,
+        ssl_config: Option<SslConfig>,
+        limits: Limits,
+    ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         let listener = listener.into();
         // building the "close" variable
         let close_trigger = Arc::new(AtomicBool::new(false));
@@ -288,12 +324,20 @@ impl Server {
         thread::spawn(move || {
             // a tasks pool is used to dispatch the connections into threads
             let tasks_pool = util::TaskPool::new();
+            let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut last_warning: Option<std::time::Instant> = None;
 
             log::debug!("Running accept thread");
             while !inside_close_trigger.load(Relaxed) {
                 let new_client = match server.accept() {
                     Ok((sock, _)) => {
                         use util::RefinedTcpStream;
+                        if limits.max_connections.is_some_and(|max| live.load(Relaxed) >= max) {
+                            continue; // dropping the socket closes it
+                        }
+                        if sock.set_timeouts(limits.idle_timeout).is_err() {
+                            continue;
+                        }
                         let (read_closable, write_closable) = match ssl {
                             None => RefinedTcpStream::new(sock),
                             #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
@@ -311,7 +355,7 @@ impl Server {
                             Some(ref _ssl) => unreachable!(),
                         };
 
-                        Ok(ClientConnection::new(write_closable, read_closable))
+                        Ok(ClientConnection::new(write_closable, read_closable, limits))
                     }
                     Err(e) => Err(e),
                 };
@@ -320,7 +364,10 @@ impl Server {
                     Ok(client) => {
                         let messages = inside_messages.clone();
                         let mut client = Some(client);
+                        live.fetch_add(1, Relaxed);
+                        let mut connection = Some(LiveConnection(live.clone()));
                         tasks_pool.spawn(Box::new(move || {
+                            let _connection = connection.take();
                             if let Some(client) = client.take() {
                                 // Synchronization is needed for HTTPS requests to avoid a deadlock
                                 if client.secure() {
@@ -338,10 +385,16 @@ impl Server {
                         }));
                     }
 
+                    // out of file descriptors, say: wait and go on rather than stop serving
                     Err(e) => {
-                        log::error!("Error accepting new client: {}", e);
-                        inside_messages.push(e.into());
-                        break;
+                        if inside_close_trigger.load(Relaxed) {
+                            break;
+                        }
+                        if last_warning.map_or(true, |t| t.elapsed().as_secs() >= 10) {
+                            eprintln!("tiny_http: accepting a connection failed ({e}); retrying");
+                            last_warning = Some(std::time::Instant::now());
+                        }
+                        thread::sleep(std::time::Duration::from_millis(100));
                     }
                 }
             }

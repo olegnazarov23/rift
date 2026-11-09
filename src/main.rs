@@ -159,6 +159,13 @@ struct GatewayArgs {
     /// size, are left as they are
     #[arg(long, default_value_t = 2048)]
     max_unpacked_mb: u64,
+    /// Seconds a client may leave a read or write waiting (the TLS handshake included), and may
+    /// take to send a request's headers, before it's disconnected
+    #[arg(long, default_value_t = 60)]
+    client_timeout_secs: u64,
+    /// Connections served at once; more are closed as they arrive
+    #[arg(long, default_value_t = 1024)]
+    max_connections: usize,
 }
 
 fn state_dir(given: &Option<std::path::PathBuf>, bucket: &str) -> std::path::PathBuf {
@@ -244,7 +251,17 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
         cold_reads: Arc::new(gateway::Slots::new(args.max_cold_reads)),
         spill: Arc::new(gateway::Slots::new(args.max_spill_gb << 30)),
     })
-    .serve(&args.listen, tls)
+    .serve(
+        &args.listen,
+        tls,
+        tiny_http::Limits {
+            idle_timeout: Some(std::time::Duration::from_secs(args.client_timeout_secs)),
+            header_timeout: Some(std::time::Duration::from_secs(args.client_timeout_secs)),
+            max_header_bytes: Some(64 << 10),
+            max_headers: Some(200),
+            max_connections: Some(args.max_connections),
+        },
+    )
 }
 
 #[derive(Args)]

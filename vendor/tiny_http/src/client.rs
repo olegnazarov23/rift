@@ -1,3 +1,4 @@
+// Changed for rift: a deadline and size limits for request headers; see vendor/tiny_http/README.md.
 use ascii::AsciiString;
 
 use std::io::Error as IoError;
@@ -10,7 +11,8 @@ use std::str::FromStr;
 use crate::common::{HTTPVersion, Method};
 use crate::util::RefinedTcpStream;
 use crate::util::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder};
-use crate::Request;
+use crate::{Limits, Request};
+use std::time::Instant;
 
 /// A ClientConnection is an object that will store a socket to a client
 /// and return Request objects.
@@ -34,6 +36,8 @@ pub struct ClientConnection {
 
     // true if the connection goes through SSL
     secure: bool,
+
+    limits: Limits,
 }
 
 /// Error that can happen when reading a request.
@@ -51,6 +55,7 @@ impl ClientConnection {
     pub fn new(
         write_socket: RefinedTcpStream,
         mut read_socket: RefinedTcpStream,
+        limits: Limits,
     ) -> ClientConnection {
         let remote_addr = read_socket.peer_addr();
         let secure = read_socket.secure();
@@ -65,6 +70,7 @@ impl ClientConnection {
             next_header_source: first_header,
             no_more_requests: false,
             secure,
+            limits,
         }
     }
 
@@ -77,7 +83,10 @@ impl ClientConnection {
     ///
     /// Reads until `CRLF` is reached. The next read will start
     ///  at the first byte of the new line.
-    fn read_next_line(&mut self) -> IoResult<AsciiString> {
+    ///
+    /// `started` is when the request's first byte came (set here if it's this one) and `budget`
+    /// the header bytes still allowed, for the deadline and size limits.
+    fn read_next_line(&mut self, started: &mut Option<Instant>, budget: &mut usize) -> IoResult<AsciiString> {
         let mut buf = Vec::new();
         let mut prev_byte_was_cr = false;
 
@@ -88,6 +97,15 @@ impl ClientConnection {
                 Some(b) => b?,
                 None => return Err(IoError::new(ErrorKind::ConnectionAborted, "Unexpected EOF")),
             };
+
+            let started = *started.get_or_insert_with(Instant::now);
+            if self.limits.header_timeout.is_some_and(|t| started.elapsed() > t) {
+                return Err(IoError::new(ErrorKind::TimedOut, "request headers took too long"));
+            }
+            if *budget == 0 {
+                return Err(IoError::new(ErrorKind::InvalidData, "request headers too large"));
+            }
+            *budget -= 1;
 
             if byte == b'\n' && prev_byte_was_cr {
                 buf.pop(); // removing the '\r'
@@ -104,10 +122,11 @@ impl ClientConnection {
     /// Reads a request from the stream.
     /// Blocks until the header has been read.
     fn read(&mut self) -> Result<Request, ReadError> {
+        let (mut started, mut budget) = (None, self.limits.max_header_bytes.unwrap_or(usize::MAX));
         let (method, path, version, headers) = {
             // reading the request line
             let (method, path, version) = {
-                let line = self.read_next_line().map_err(ReadError::ReadIoError)?;
+                let line = self.read_next_line(&mut started, &mut budget).map_err(ReadError::ReadIoError)?;
 
                 parse_request_line(
                     line.as_str().trim(), // TODO: remove this conversion
@@ -118,11 +137,14 @@ impl ClientConnection {
             let headers = {
                 let mut headers = Vec::new();
                 loop {
-                    let line = self.read_next_line().map_err(ReadError::ReadIoError)?;
+                    let line = self.read_next_line(&mut started, &mut budget).map_err(ReadError::ReadIoError)?;
 
                     if line.is_empty() {
                         break;
                     };
+                    if self.limits.max_headers.is_some_and(|m| headers.len() >= m) {
+                        return Err(ReadError::WrongHeader(version));
+                    }
                     headers.push(match FromStr::from_str(line.as_str().trim()) {
                         // TODO: remove this conversion
                         Ok(h) => h,

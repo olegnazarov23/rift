@@ -1,3 +1,4 @@
+// Changed for rift: Connection::set_timeouts; see vendor/tiny_http/README.md.
 //! Abstractions of Tcp and Unix socket types
 
 #[cfg(unix)]
@@ -92,6 +93,15 @@ impl Connection {
             Self::Tcp(s) => s.shutdown(how),
             #[cfg(unix)]
             Self::Unix(s) => s.shutdown(how),
+        }
+    }
+
+    /// How long a read or write may wait before it fails.
+    pub(crate) fn set_timeouts(&self, t: Option<std::time::Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(s) => s.set_read_timeout(t).and_then(|_| s.set_write_timeout(t)),
+            #[cfg(unix)]
+            Self::Unix(s) => s.set_read_timeout(t).and_then(|_| s.set_write_timeout(t)),
         }
     }
 

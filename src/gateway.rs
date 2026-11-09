@@ -367,12 +367,10 @@ impl Sink {
 
 impl Gateway {
     /// Serves HTTP, or HTTPS with `tls` = (certificate PEM, private key PEM).
-    pub fn serve(self: Arc<Self>, listen: &str, tls: Option<(Vec<u8>, Vec<u8>)>) -> Result<()> {
-        let server = match tls {
-            Some((certificate, private_key)) => Server::https(listen, tiny_http::SslConfig { certificate, private_key }),
-            None => Server::http(listen),
-        }
-        .map_err(|e| anyhow!("listening on {listen}: {e}"))?;
+    pub fn serve(self: Arc<Self>, listen: &str, tls: Option<(Vec<u8>, Vec<u8>)>, limits: tiny_http::Limits) -> Result<()> {
+        let listener = std::net::TcpListener::bind(listen).map_err(|e| anyhow!("listening on {listen}: {e}"))?;
+        let ssl = tls.map(|(certificate, private_key)| tiny_http::SslConfig { certificate, private_key });
+        let server = Server::from_listener_with_limits(listener, ssl, limits).map_err(|e| anyhow!("listening on {listen}: {e}"))?;
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for req in server.incoming_requests() {
             if active.load(std::sync::atomic::Ordering::Relaxed) >= self.max_requests {
@@ -985,6 +983,75 @@ mod tests {
         assert!(new.exists(), "may still be written");
         assert!(other.exists(), "not ours");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn drops_stalled_and_oversized_clients() {
+        use std::{
+            io::{Read, Write},
+            net::TcpStream,
+            time::Instant,
+        };
+        let serve = |limits: tiny_http::Limits| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            (Server::from_listener_with_limits(listener, None, limits).unwrap(), addr)
+        };
+        // how long until the server closes the connection
+        let closes_after = |s: &TcpStream| {
+            let (t, mut s) = (Instant::now(), s.try_clone().unwrap());
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut b = [0u8; 512];
+            while let Ok(n) = s.read(&mut b) {
+                if n == 0 {
+                    break;
+                }
+            }
+            t.elapsed()
+        };
+        let limits = tiny_http::Limits {
+            idle_timeout: Some(Duration::from_millis(500)),
+            header_timeout: Some(Duration::from_millis(800)),
+            max_header_bytes: Some(4096),
+            max_headers: Some(20),
+            max_connections: Some(3),
+        };
+        let (server, addr) = serve(limits);
+        // a client that connects and sends nothing
+        assert!(closes_after(&TcpStream::connect(addr).unwrap()) < Duration::from_secs(3));
+        // a client that drips its headers a byte at a time, each well within the idle timeout
+        let drip = TcpStream::connect(addr).unwrap();
+        let mut writer = drip.try_clone().unwrap();
+        thread::spawn(move || {
+            for b in b"GET / HTTP/1.1\r\nHost: x\r\nX-Slow: abcdefghijklmnopqrstuvwxyz\r\n\r\n" {
+                if writer.write_all(&[*b]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        assert!(closes_after(&drip) < Duration::from_secs(3), "the header deadline cuts it off before it's done");
+        // headers bigger than allowed
+        let mut big = TcpStream::connect(addr).unwrap();
+        let _ = big.write_all(format!("GET / HTTP/1.1\r\nX-Big: {}\r\n\r\n", "a".repeat(8000)).as_bytes());
+        assert!(closes_after(&big) < Duration::from_secs(3));
+        assert!(server.try_recv().unwrap().is_none(), "none of those became a request");
+        // and an ordinary request still gets through
+        let mut ok = TcpStream::connect(addr).unwrap();
+        ok.write_all(b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let rq = server.recv_timeout(Duration::from_secs(3)).unwrap().expect("a request");
+        assert_eq!(rq.url(), "/x");
+        rq.respond(Response::from_string("ok")).unwrap();
+
+        // connections beyond the cap are closed as they arrive; the others stay open
+        let (_server, addr) = serve(tiny_http::Limits { idle_timeout: Some(Duration::from_secs(5)), max_connections: Some(2), ..Default::default() });
+        let held: Vec<TcpStream> = (0..2).map(|_| TcpStream::connect(addr).unwrap()).collect();
+        thread::sleep(Duration::from_millis(200));
+        assert!(closes_after(&TcpStream::connect(addr).unwrap()) < Duration::from_secs(1), "over the cap");
+        let mut probe = held[0].try_clone().unwrap();
+        probe.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut b = [0u8; 8];
+        assert!(probe.read(&mut b).is_err(), "still open: the read times out rather than seeing the close");
     }
 
     #[test]

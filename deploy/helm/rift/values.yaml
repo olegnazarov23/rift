@@ -69,6 +69,9 @@ limits:
   maxColdReads: 4
   # temp disk for rebuilt blobs waiting on slow clients: keep it under tmp.sizeLimit
   maxSpillGB: 16
+  # a client stalled this long, or this slow to send its headers, is dropped
+  clientTimeoutSecs: 60
+  maxConnections: 1024
 
 # Serve HTTPS from a kubernetes.io/tls Secret (kubectl create secret tls rift-tls --cert=… --key=…);
 # then the registry uses https://<service>:9100 with secure: true.
