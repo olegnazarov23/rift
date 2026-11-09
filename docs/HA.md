@@ -70,7 +70,7 @@ read.
 | The compactor | Compaction, cooling and GC pause; serving goes on. After a crash Kubernetes restarts it and it carries on at once; a new pod (an upgrade, a lost node) waits up to two minutes for the old lock to go stale. A standby compactor, if you run one, takes over after about two minutes |
 | The bucket | Everything waits for it, as without rift |
 
-## Upgrading from 0.1.4
+## Upgrading from 0.1.4 or earlier
 
 The chart keeps the single gateway's Deployment as the compactor and adds the serving one, then
 points the Service at the serving gateways. Expect a few seconds without a ready endpoint while
@@ -92,6 +92,10 @@ more request each.
   standby to take over). 807 blobs (1.3 GB) were read back through the serving gateways and
   checked against their digests: no mismatch and no failed read. The bucket audit found nothing
   missing and nothing left over.
+- **The same soak, later, found a GC bug** present since 0.1.0: after a restart or a takeover, GC
+  could point blobs at a pack it was about to delete; it lost two blobs. Fixed in 0.1.6. Two
+  15-minute soaks on the fix (13 compactor kills, 8 of them takeovers) read back 912 blobs, all
+  byte-exact, and the audits were clean.
 - **Deletes through serving gateways**: every tag deleted and the registry's GC run (304 blobs
   deleted through the serving gateways); the compactor noticed, collected, and after the grace
   period the bucket held no packs at all.

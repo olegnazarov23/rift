@@ -1,49 +1,48 @@
 # rift
 
-Byte-exact recompression for container registries and object storage.
+Byte-exact recompression for container registry storage. rift sits between your registry and the
+S3 bucket it already uses, and stores image layers in less space: 39–79% less in our tests. Every
+byte comes back exactly as it was pushed, so digests, signatures and pull commands don't change.
 
-- `rift gateway` is an S3 endpoint in front of the bucket your registry already uses
-  (distribution, Harbor, GitLab). Blobs nobody has touched for a while are stored smaller, and
-  every byte comes back exactly as it was pushed, so digests never change.
-- `rift scan` tells you how much smaller your data would be. It only reads. Every blob it
-  recompresses is rebuilt in memory and compared with the original before it counts.
+| Data (every blob read back and checked against its digest) | Registry sees | Stored | Saved |
+|---|---|---|---|
+| 21 versions of nginx, node, postgres, python and redis | 1,295 MB | 466 MB | 64% |
+| redis 7.4.0–7.4.2 and postgres 17.2–17.4, distribution on AWS S3 | 577.7 MB | 239.1 MB | 58.6% |
+| redis 7.4.1–7.4.2 and postgres 17.4, Harbor 2.14 | 249.1 MB | 138.2 MB | 44.5% |
+| 30 consecutive CI builds of grafana-dev (the chunk store alone, no registry) | 11,072.5 MB | 2,277.5 MB | 79.4% |
 
-**Status: early.** Tested end to end on MinIO under distribution 2.8, Harbor 2.14 and GitLab's
-registry 4.41: 39–59% less storage on our test images. The same chunk store saved 79% on 30
-consecutive CI builds of one project. On AWS S3 (us-east-1, driven from a laptop) the same images
-saved the same 58.6% under distribution, and GitLab's registry worked with its default checksums;
-not yet run in-region at scale. To try it on your registry, see
-[docs/PILOT.md](docs/PILOT.md).
+The more versions a registry keeps, the more it saves: GitLab's registry with just redis 7.4.2 and
+postgres 17.4, on AWS S3, saved 39.4%.
 
-## Scan a registry
+## How it works
+
+Image layers are gzip, so a bucket can't compress them, and two versions of an image share almost
+nothing once compressed. rift unpacks each layer with
+[preflate](https://github.com/microsoft/preflate-rs), which records how the encoder compressed it
+so the exact bytes can be produced again. It keeps the content as deduplicated chunks in zstd
+packs, in the same bucket. A blob is replaced by an empty stub only after rift has rebuilt it from
+what it stored and checked its digest, and a read rebuilds it as a stream.
+
+The full picture, with what it costs and where it falls short: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
+
+## Try it: how much would your registry save?
+
+`rift scan` estimates the saving on a registry's images. It only reads, and it rebuilds every blob
+it recompresses and compares it with the original before counting it.
 
     rift scan registry://docker.io/library/redis --latest 10
     rift scan registry://ghcr.io/OWNER/IMAGE --tags v1.2.0,v1.3.0
     RIFT_REGISTRY_USER=me RIFT_REGISTRY_PASSWORD=token rift scan registry://registry.example.com/team/app
 
-Each digest is counted once, the way the registry stores it, so the savings are on top of
-the layer sharing you already have.
+Each digest is counted once, the way the registry stores it, so the saving is on top of the layer
+sharing you already have. On 136 blobs from 21 images (1.29 GB) the scan predicted 466.3 MB;
+building the real store from the same blobs took 468.7 MB.
 
-## Scan a directory
-
-    rift scan /mnt/bucket-copy --max-gb 50
-
-Files that are byte-for-byte copies of other files are counted once and listed separately,
-so they don't inflate the number.
-
-## What happens to each blob
-
-- **gzip** (image layers, `.gz` logs and exports): the deflate stream is unpacked, with a small
-  recipe that recreates it bit for bit ([preflate](https://github.com/microsoft/preflate-rs)).
-  The unpacked content goes into a content-defined chunk store (FastCDC, 64 KB average):
-  repeats across blobs are kept once, and new chunks are packed and compressed with zstd.
-- **JPEG**: [Lepton](https://github.com/microsoft/lepton_jpeg_rust), about 22% smaller.
-- **Anything else** goes through the same chunk store as it is.
-
-A gzip stream that rift can't rebuild exactly (multi-member files, some encoders) is kept as
-is, and the report says how many there were and why.
-
-## Options
+It also scans a directory, such as a copy of a bucket: `rift scan /mnt/bucket-copy --max-gb 50`.
+There, besides gzip, it counts JPEG recompressed with
+[Lepton](https://github.com/microsoft/lepton_jpeg_rust) (17.5% smaller on our test photos) and
+other files deduplicated as they are, and it lists byte-for-byte copies separately so they don't
+inflate the number.
 
     --tags a,b,c     registry tags to scan (default: the --latest N most recent, oldest first)
     --platform       which image of a multi-arch tag (default linux/amd64)
@@ -54,13 +53,7 @@ is, and the report says how many there were and why.
     --no-verify      skip the rebuild check (faster)
     --json           machine-readable report
 
-## How close is the estimate
-
-On 136 unique blobs from 21 Docker Hub images (1.29 GB), the scan predicted 466.3 MB.
-Building the real chunk store from the same blobs took 468.7 MB. With `--level 9` the scan
-predicts 522.7 MB: faster, and pessimistic by about 4 points.
-
-## Gateway
+## Run it
 
 `rift gateway` is the S3 endpoint your registry talks to, in front of its existing bucket:
 
@@ -68,65 +61,53 @@ predicts 522.7 MB: faster, and pessimistic by about 4 points.
     RIFT_CLIENT_ACCESS_KEY=… RIFT_CLIENT_SECRET_KEY=… \
     rift gateway --backend https://s3.us-east-1.amazonaws.com --bucket my-registry --cold-after 7d
 
-Point the registry's S3 storage at it (distribution, Harbor and GitLab all take a `regionendpoint`),
-sign with the client keys, and set `redirect: disable: true`. Instead of backend keys, rift can use
-an AWS role: IRSA, EKS Pod Identity, ECS task roles or EC2 instance profiles.
+Point the registry's S3 storage at it (distribution, Harbor and GitLab's registry all take an
+endpoint), sign with the client keys, and keep the bucket name. Instead of backend keys, rift can
+use an AWS role (IRSA, EKS Pod Identity, ECS task roles, EC2 instance profiles). The Helm chart in
+`deploy/helm/rift` runs two serving gateways and one compactor, so losing a gateway doesn't
+interrupt the registry. The image is `ghcr.io/olegnazarov23/rift:0.1.6`, for amd64 and arm64.
 
-- Requests pass through to the bucket, re-signed with the backend keys.
-- Blobs nobody has written or read for `--cold-after` are compacted. preflate unpacks them, the
-  content goes into deduplicated packs under `.rift/` in the same bucket, and each blob is rebuilt
-  from what was stored and checked against its digest. Only then is the original replaced by an
-  empty stub.
-- A read of a compacted blob streams the rebuild, byte ranges included. Listings show the original
-  size and date. Deleting a blob drops its manifest.
-- Chunk GC runs after deletes. Packs nothing uses are retired; packs under half used
-  (`--gc-rewrite-below`) have their live chunks copied out first. Retired packs stay readable for
-  `--gc-grace` (default 10m), so reads already streaming finish, then they're deleted.
-- After a full cold read, the original is put back in the bucket (a hot copy) until nobody has read
-  it for `--cold-after`; then the stub goes back (`--no-hot-copy` turns this off).
-- With `--redirect-endpoint`, a registry that redirects blob downloads to storage keeps doing so:
-  blobs stored as they are get a presigned redirect to the backend, and only cold ones stream
-  through rift.
-- `GET /-/metrics` (Prometheus: stored vs logical bytes, compaction, cold reads, GC) and
-  `GET /-/healthz`; `rift eject` puts every original back and removes rift's data.
-- Every request must be signed with the client keys within 15 minutes of rift's clock; bodies are
-  checked against their signed hash, chunk signatures and checksums. Only the S3 operations
-  registries use are passed on; tagging, ACLs, versions and bucket settings get 501.
-  `--tls-cert`/`--tls-key` serve HTTPS. `--max-body-mb`, `--max-requests`, `--max-connections`, `--max-cold-reads` and `--max-spill-gb`
-  bound what one client can take, and stalled clients are dropped (`--client-timeout-secs`); compaction stops unpacking deflate bombs (`--max-unpacked-mb`, 100× ratio) (details in [docs/PILOT.md](docs/PILOT.md#5-security)).
-- `--access-log` writes a JSON audit line per request (who, what, status, bytes, how it was served).
-- At start, rift checks the bucket's lifecycle rules, versioning and Object Lock, and warns about
-  settings that would delete its data or cancel the savings ([bucket settings](docs/PILOT.md#6-bucket-settings)).
+What the gateway does:
 
-- Several gateways can serve one bucket (`--serve-only`) while one compacts it; the chart runs two
-  serving and one compacting, so losing a gateway doesn't interrupt the registry
-  ([high availability](docs/HA.md)).
+- Passes requests through to the bucket, re-signed with its own credentials.
+- Compacts blobs nobody has written or read for `--cold-after`, about 19 MB/s on a 12-core server,
+  the repositories with the most versions first.
+- Rebuilds compacted blobs as they're read, byte ranges included, and keeps a hot copy while a blob
+  is in use.
+- Reclaims the space of deleted blobs with its own garbage collection.
+- Checks every request's SigV4 signature and passes on only the S3 operations registries use.
+- Serves Prometheus metrics at `/-/metrics` (stored against logical bytes, compaction, cold reads,
+  GC) and health at `/-/healthz`.
+- Warns at start about bucket settings that would delete its data or cancel the saving.
+- Leaves on request: `rift eject` puts every original back and removes rift's data.
 
-Running it for a pilot (Docker, Helm, registry settings, leaving): [docs/PILOT.md](docs/PILOT.md).
+Running a pilot (Docker, Helm, registry settings, limits, leaving): [docs/PILOT.md](docs/PILOT.md).
 
-Tested locally against distribution 2.8.3 and MinIO with 3 redis and 3 postgres images (69 blobs,
-577.7 MB). The bucket held 238.6 MB, 58.7% less. Every blob read back through the registry was
-byte-exact, `docker pull` from scratch worked and the image ran, and registry garbage collection
-deleted compacted blobs cleanly. The same under Harbor v2.14.6 (its `storage_service.s3` pointed at
-rift): 3 images, 249.1 MB stored in 138.2 MB, every blob byte-exact, `docker pull` from scratch fine.
-Deleting 3 of the 6 images and running both garbage collectors took the first bucket from 237.7 MB
-to 146.9 MB for the remaining 249.1 MB, close to the 138.2 MB of a fresh store of the same images;
-every remaining blob stayed byte-exact.
+## Status
+
+Early: version 0.1.6, which also fixes a GC bug in earlier versions that could lose blobs after a
+restart, so upgrade. Tested end to end with distribution 2.8, Harbor 2.14 and GitLab's registry
+4.41 (both metadata modes) on MinIO, and with distribution and GitLab's registry on AWS S3, driven
+from a laptop. Not yet run in-region at scale, and no outside security review yet. Only gzip
+layers are compacted, a cold read costs CPU, and one compactor works on a bucket at a time.
+
+## Documentation
+
+- [How it works](docs/HOW-IT-WORKS.md): the design, results, costs and limits
+- [Pilot guide](docs/PILOT.md): running rift in front of your registry
+- [High availability](docs/HA.md): several gateways on one bucket
+- [Threat model](docs/THREAT-MODEL.md): what rift protects, and how
+- [Security](SECURITY.md): reporting vulnerabilities, verifying releases
 
 ## Build
 
-    cargo build --release          # or: docker build -t rift:0.1.0 .
+    cargo build --release          # or: docker build -t rift .
 
-Or use the published image, `ghcr.io/olegnazarov23/rift:0.1.6` (amd64 and arm64). Pushing a `v*` tag
-publishes a new one.
-
-preflate-rs is vendored in `vendor/preflate-rs` (our branch of microsoft/preflate-rs with restart
-points; refresh it with `scripts/vendor-preflate.sh`). Lepton comes from crates.io. A Helm chart is
-in `deploy/helm/rift`.
+preflate-rs is vendored in `vendor/preflate-rs`: our branch of microsoft/preflate-rs with restart
+points, refreshed with `scripts/vendor-preflate.sh`. Lepton comes from crates.io. Pushing a `v*`
+tag builds, signs and publishes a release image.
 
 ## License
 
-Security: [threat model](docs/THREAT-MODEL.md).
-
 Apache-2.0, see [LICENSE](LICENSE). `vendor/preflate-rs` is Microsoft's preflate-rs, also
-Apache-2.0, with our changes ([NOTICE](NOTICE)). Security reports: [SECURITY.md](SECURITY.md).
+Apache-2.0, with our changes ([NOTICE](NOTICE)).

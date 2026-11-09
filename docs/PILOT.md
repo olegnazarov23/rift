@@ -21,17 +21,18 @@ On our tests: 64% less on official Docker Hub images, 79% on 30 consecutive CI b
 - The bucket, and access to it for rift: an IAM role (IRSA, EKS Pod Identity, ECS task role or
   EC2 instance profile) or a key, with the policy below. rift keeps its data in the same bucket,
   under `.rift/`.
-- Somewhere to run rift next to the registry, in the bucket's region: 2 or more cores; memory for
-  compaction, which peaks near 2.5 times the largest unpacked blob it takes on (`--max-unpacked-mb`,
-  default 2048) plus about 135 MB per thread, so 8 GB for the defaults with 4 threads; temp space for
-  your largest layer, and local disk for the chunk index (about 60 bytes per
-  stored chunk, roughly 1 GB per TB stored). The index is rebuilt from the bucket if it's lost; keep
+- Somewhere to run rift next to the registry, in the bucket's region. For the compactor: 2 or more
+  cores (compaction speeds up with every core), and memory that peaks near 2.5 times
+  `--max-unpacked-mb` (default 2048, the unpacked content it holds at once) plus about 135 MB per
+  thread, so 8 GB for the defaults with 4 threads. Local disk for its chunk index: about 60 bytes per
+  stored chunk, roughly 1 GB per TB stored. The index is rebuilt from the bucket if it's lost; keep
   it on a persistent volume (`state.persistence.enabled` in the chart) to skip that on restarts.
+  Serving gateways need 2–4 GB each and no disk but temp space for your largest layers.
 
 ## 3. Run rift
 
 The image is `ghcr.io/olegnazarov23/rift:0.1.6`, for amd64 and arm64; the chart uses it by default.
-To build your own, run `docker build -t rift:0.1.0 .` and set `image.repository`. Two sets of keys go
+To build your own, run `docker build -t rift .` and set `image.repository`. Two sets of keys go
 in the environment:
 
 | Variable | What it is |
@@ -165,7 +166,7 @@ endpoint as well as the registry.
 | `--max-requests` | 512 | requests in flight |
 | `--max-cold-reads` | 4 | rebuilds at once; more wait up to a minute |
 | `--max-spill-gb` | 16 | temp disk for rebuilt blobs waiting on slow clients; keep it under the temp volume (the chart's `/tmp` is 20Gi) |
-| `--max-unpacked-mb` | 2048 | memory for unpacking one blob during compaction |
+| `--max-unpacked-mb` | 2048 | unpacked content compaction holds at once, shared by the blobs it unpacks together; a blob that unpacks to more is left as it is |
 | `--client-timeout-secs` | 60 | how long a client may stall a read or write (the TLS handshake included), and may take to send a request's headers |
 | `--max-connections` | 1024 | connections served at once; more are closed as they arrive |
 
@@ -268,7 +269,8 @@ policy above.
   masked, status, bytes in and out, milliseconds, and how it was served: `pass` (from the bucket),
   `compacted` (rebuilt from packs), `redirect`, `local` (health and metrics) or `rift` (rift's own
   refusals and errors). rift's other messages go to stderr. With the chart: `--set accessLog=true`.
-- The log has a line for every compaction batch, garbage collection, and hot copy stubbed again.
+- The log has a line for every compaction batch (with where its time went: unpacking, packs,
+  verifying), garbage collection, and hot copy stubbed again.
 
 ## 9. Leaving
 
@@ -283,10 +285,10 @@ policy above.
 
 - One compactor per bucket at a time. If it's down, serving goes on but compaction and GC wait;
   a standby compactor takes over after two minutes ([High availability](HA.md)).
-- Compaction ran at 19 MB/s on a 12-core server (Ryzen 9 5900X; 1.3 GB of layers from 148 official
-  images in 67 s, 64% saved) and 2.3 MB/s on a 6-core laptop. A backfill commits about 2 GB at a
-  time, starting with the repositories with the most layers, where most is saved. New pushes are a
-  small daily stream.
+- Compaction ran at 19 MB/s on a 12-core server (Ryzen 9 5900X; 1.3 GB of layers from 21 versions
+  of official images in 67 s, 64% saved) and 2.3 MB/s on a 6-core laptop. A backfill commits about
+  2 GB at a time, starting with the repositories with the most layers, where most is saved. New
+  pushes are a small daily stream.
 - A cold pull of a big layer on few cores is slower than a plain download, about 2–3× on 6 cores.
 - gzip layers only; zstd and eStargz layers are left as they are.
 - Blobs that unpack to more than `--max-unpacked-mb` stay as they are, so the biggest layers of ML
