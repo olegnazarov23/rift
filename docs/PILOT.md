@@ -30,7 +30,7 @@ On our tests: 64% less on official Docker Hub images, 79% on 30 consecutive CI b
 
 ## 3. Run rift
 
-The image is `ghcr.io/olegnazarov23/rift:0.1.4`, for amd64 and arm64; the chart uses it by default.
+The image is `ghcr.io/olegnazarov23/rift:0.1.5`, for amd64 and arm64; the chart uses it by default.
 To build your own, run `docker build -t rift:0.1.0 .` and set `image.repository`. Two sets of keys go
 in the environment:
 
@@ -76,7 +76,7 @@ registry. `--set serve.replicas=0` runs the compactor alone, serving too.
 
 With Docker:
 
-    docker run -d --name rift -p 9100:9100 --env-file rift.env ghcr.io/olegnazarov23/rift:0.1.4 \
+    docker run -d --name rift -p 9100:9100 --env-file rift.env ghcr.io/olegnazarov23/rift:0.1.5 \
       gateway --listen 0.0.0.0:9100 --backend https://s3.us-east-1.amazonaws.com --bucket my-registry
 
 More gateways for the same bucket take `--serve-only` (they need no state dir) and go behind one
