@@ -10,7 +10,9 @@ Byte-exact recompression for container registries and object storage.
 
 **Status: early.** Tested end to end on MinIO under distribution 2.8, Harbor 2.14 and GitLab's
 registry 4.41: 39–59% less storage on our test images. The same chunk store saved 79% on 30
-consecutive CI builds of one project. Not yet run on AWS S3 at scale. To try it on your registry, see
+consecutive CI builds of one project. On AWS S3 (us-east-1, driven from a laptop) the same images
+saved the same 58.6% under distribution, and GitLab's registry worked with its default checksums;
+not yet run in-region at scale. To try it on your registry, see
 [docs/PILOT.md](docs/PILOT.md).
 
 ## Scan a registry
@@ -108,7 +110,7 @@ every remaining blob stayed byte-exact.
 
     cargo build --release          # or: docker build -t rift:0.1.0 .
 
-Or use the published image, `ghcr.io/olegnazarov23/rift:0.1.0` (amd64 and arm64). Pushing a `v*` tag
+Or use the published image, `ghcr.io/olegnazarov23/rift:0.1.1` (amd64 and arm64). Pushing a `v*` tag
 publishes a new one.
 
 preflate-rs is vendored in `vendor/preflate-rs` (our branch of microsoft/preflate-rs with restart

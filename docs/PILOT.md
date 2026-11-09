@@ -28,7 +28,7 @@ On our tests: 64% less on official Docker Hub images, 79% on 30 consecutive CI b
 
 ## 3. Run rift
 
-The image is `ghcr.io/olegnazarov23/rift:0.1.0`, for amd64 and arm64; the chart uses it by default.
+The image is `ghcr.io/olegnazarov23/rift:0.1.1`, for amd64 and arm64; the chart uses it by default.
 To build your own, run `docker build -t rift:0.1.0 .` and set `image.repository`. Two sets of keys go
 in the environment:
 
@@ -68,7 +68,7 @@ With Helm:
 
 With Docker:
 
-    docker run -d --name rift -p 9100:9100 --env-file rift.env ghcr.io/olegnazarov23/rift:0.1.0 \
+    docker run -d --name rift -p 9100:9100 --env-file rift.env ghcr.io/olegnazarov23/rift:0.1.1 \
       gateway --listen 0.0.0.0:9100 --backend https://s3.us-east-1.amazonaws.com --bucket my-registry
 
 ## 4. Point the registry at rift
@@ -220,4 +220,5 @@ network: signatures stop tampering and replays, but blob contents cross the netw
 - gzip layers only; zstd and eStargz layers are left as they are.
 - No timeout for clients that connect and stall mid-request (see Security).
 - Tested end to end with distribution 2.8.3, Harbor 2.14.6 and GitLab's registry 4.41 (both
-  metadata modes) on MinIO; not yet on AWS S3 at scale.
+  metadata modes) on MinIO, and with distribution and GitLab's registry (metadata database, default
+  checksums) on AWS S3 in us-east-1, driven from a laptop. Not yet run in-region at scale.
