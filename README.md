@@ -114,7 +114,7 @@ every remaining blob stayed byte-exact.
 
     cargo build --release          # or: docker build -t rift:0.1.0 .
 
-Or use the published image, `ghcr.io/olegnazarov23/rift:0.1.3` (amd64 and arm64). Pushing a `v*` tag
+Or use the published image, `ghcr.io/olegnazarov23/rift:0.1.4` (amd64 and arm64). Pushing a `v*` tag
 publishes a new one.
 
 preflate-rs is vendored in `vendor/preflate-rs` (our branch of microsoft/preflate-rs with restart

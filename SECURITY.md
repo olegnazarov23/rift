@@ -21,3 +21,10 @@ workflow) and carry a GitHub build-provenance attestation and an SBOM:
 Each image is scanned with Trivy before it's published and isn't released with a fixable critical
 vulnerability. It's built on distroless (no shell or package manager) from base images pinned by
 digest. Dependencies are checked against the RustSec advisories on every push and weekly.
+
+## Fixed vulnerabilities
+
+- **0.1.4** fixes what an adversarial review of 0.1.3 found, including an unauthenticated crash (a
+  request claiming a huge `Content-Length`) and a way for a holder of the client keys to lose a
+  compacted blob (PutObjectTagging replaced it with its empty stub). Upgrade from any earlier
+  version. The details are in [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md).
