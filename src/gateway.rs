@@ -110,21 +110,93 @@ fn redact(s: &str) -> String {
 /// Query parameters that only carry a presigned URL's signature.
 const PRESIGN_PARAMS: &[&str] = &[
     "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires", "X-Amz-SignedHeaders",
-    "X-Amz-Signature", "X-Amz-Security-Token", "x-id",
+    "X-Amz-Signature", "X-Amz-Security-Token",
 ];
+
+/// Names the operation for newer AWS SDKs (GitLab's s3_v2 driver sends it); S3 ignores it.
+const SDK_HINT: &str = "x-id";
 
 static SPILL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Bucket-level GETs that aren't object listings.
-const BUCKET_SUBRESOURCES: &[&str] = &[
-    "uploads", "versions", "location", "versioning", "acl", "policy", "policyStatus", "lifecycle", "cors",
-    "tagging", "website", "notification", "logging", "replication", "encryption", "object-lock", "accelerate",
-    "requestPayment", "analytics", "inventory", "metrics", "ownershipControls", "publicAccessBlock",
-    "intelligent-tiering",
-];
+/// Whether rift passes on a key: none that start with '/', hold an empty segment, or a '.' or '..'
+/// one. Backends normalize such keys differently (MinIO drops a leading '/', so "//.rift/x" reached
+/// rift's own data), and registries never use them.
+fn valid_key(key: &str) -> bool {
+    !key.starts_with('/') && !key.contains("//") && !key.split('/').any(|s| s == "." || s == "..")
+}
+
+/// rift's own data, out of clients' reach.
+fn internal(key: &str) -> bool {
+    key == ".rift" || key.starts_with(".rift/")
+}
+
+/// The requests registries make, and the only ones rift passes on: bucket configuration,
+/// tagging, ACLs, versions and the like are refused, with rift's credentials or not.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Op {
+    /// ListObjects V1 or V2
+    List,
+    /// ListMultipartUploads
+    Uploads,
+    Location,
+    HeadBucket,
+    /// DeleteObjects
+    DeleteMany,
+    /// GetObject or HeadObject, with response-* overrides
+    Get,
+    /// ListParts
+    Parts,
+    Put,
+    /// CopyObject
+    Copy,
+    /// UploadPart or UploadPartCopy
+    Part,
+    /// CreateMultipartUpload
+    Create,
+    /// CompleteMultipartUpload
+    Complete,
+    Delete,
+    /// AbortMultipartUpload
+    Abort,
+}
+
+fn operation(method: &str, key: &str, query: &[(String, String)], copy: bool) -> Option<Op> {
+    let names: Vec<&str> = query.iter().map(|(k, _)| k.as_str()).collect();
+    let only = |allowed: &[&str]| names.iter().all(|n| allowed.contains(n));
+    let has = |n: &str| names.contains(&n);
+    const LIST: &[&str] =
+        &["list-type", "prefix", "delimiter", "max-keys", "continuation-token", "start-after", "encoding-type", "fetch-owner", "marker"];
+    const UPLOADS: &[&str] = &["uploads", "prefix", "delimiter", "key-marker", "upload-id-marker", "max-uploads", "encoding-type"];
+    const PARTS: &[&str] = &["uploadId", "part-number-marker", "max-parts", "encoding-type"];
+    if key.is_empty() {
+        return match method {
+            "GET" if has("uploads") && only(UPLOADS) => Some(Op::Uploads),
+            "GET" if names == ["location"] => Some(Op::Location),
+            "GET" if only(LIST) => Some(Op::List),
+            "HEAD" if names.is_empty() => Some(Op::HeadBucket),
+            "POST" if names == ["delete"] => Some(Op::DeleteMany),
+            _ => None,
+        };
+    }
+    let upload = has("uploadId");
+    match method {
+        "GET" if upload && only(PARTS) => Some(Op::Parts),
+        "GET" | "HEAD" if names.iter().all(|n| n.starts_with("response-")) => Some(Op::Get),
+        "PUT" if upload && has("partNumber") && names.len() == 2 => Some(Op::Part),
+        "PUT" if names.is_empty() && copy => Some(Op::Copy),
+        "PUT" if names.is_empty() => Some(Op::Put),
+        "POST" if names == ["uploads"] => Some(Op::Create),
+        "POST" if names == ["uploadId"] => Some(Op::Complete),
+        "DELETE" if names.is_empty() => Some(Op::Delete),
+        "DELETE" if names == ["uploadId"] => Some(Op::Abort),
+        _ => None,
+    }
+}
 
 enum After {
     Nothing,
+    /// DeleteObjects: forget the keys the bucket reports deleted
+    ForgetDeleted,
     RewriteList,
     /// these keys were deleted or overwritten if the request succeeds
     Forget(Vec<String>),
@@ -224,8 +296,8 @@ fn rewrite_list(xml: &str, compacted: &dyn Fn(&str) -> Option<(u64, u64)>) -> St
         };
         let end = i + len + "</Contents>".len();
         let block = &rest[i..end];
-        let key = s3::xml_first(block, "Key").map(xml_unescape).unwrap_or_default();
-        if key.starts_with(".rift/") {
+        let key = s3::xml_first(block, "Key").map(|k| uri_decode(&xml_unescape(k))).unwrap_or_default();
+        if internal(&key) || !valid_key(&key) {
             hidden += 1;
         } else if let Some((size, mtime)) = compacted(&key) {
             out.push_str(&set(&set(block, "Size", &size.to_string()), "LastModified", &s3::iso(mtime)));
@@ -235,11 +307,26 @@ fn rewrite_list(xml: &str, compacted: &dyn Fn(&str) -> Option<(u64, u64)>) -> St
         rest = &rest[end..];
     }
     out.push_str(rest);
-    let ours = "<CommonPrefixes><Prefix>.rift/</Prefix></CommonPrefixes>";
-    if out.contains(ours) {
-        out = out.replacen(ours, "", 1);
-        hidden += 1;
+    // and every common prefix inside rift's data (a listing with prefix=.rift/ and a delimiter)
+    let mut kept = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(i) = rest.find("<CommonPrefixes>") {
+        kept.push_str(&rest[..i]);
+        let Some(len) = rest[i..].find("</CommonPrefixes>") else {
+            rest = &rest[i..];
+            break;
+        };
+        let end = i + len + "</CommonPrefixes>".len();
+        let prefix = s3::xml_first(&rest[i..end], "Prefix").map(|p| uri_decode(&xml_unescape(p))).unwrap_or_default();
+        if internal(prefix.trim_end_matches('/')) || prefix.starts_with(".rift/") || prefix.starts_with('/') {
+            hidden += 1;
+        } else {
+            kept.push_str(&rest[i..end]);
+        }
+        rest = &rest[end..];
     }
+    kept.push_str(rest);
+    out = kept;
     if hidden > 0
         && let Some(n) = s3::xml_first(&out, "KeyCount").and_then(|n| n.parse::<usize>().ok())
     {
@@ -496,50 +583,80 @@ impl Gateway {
             }
         }
         let seed = seed.as_ref();
-        query.retain(|(k, _)| !PRESIGN_PARAMS.contains(&k.as_str()));
+        if self.client_keys.is_some() {
+            // one way to authenticate: a presigned signature moved into a header would skip its expiry
+            if !presigned && query.iter().any(|(k, _)| PRESIGN_PARAMS.contains(&k.as_str())) {
+                return error(req, 400, "InvalidRequest", "only one auth mechanism allowed: the Authorization header or a presigned URL");
+            }
+            // as S3 requires: headers that change what's stored or how a body is read must be signed
+            let signed: Vec<String> = if presigned {
+                query.iter().find(|(k, _)| k == "X-Amz-SignedHeaders").map_or(vec![], |(_, v)| v.split(';').map(str::to_string).collect())
+            } else {
+                header("authorization")
+                    .and_then(|a| a.split(',').find_map(|f| f.trim().strip_prefix("SignedHeaders=").map(str::to_string)))
+                    .map_or(vec![], |v| v.split(';').map(str::to_string).collect())
+            };
+            let unsigned = headers
+                .iter()
+                .find(|(k, _)| (k.starts_with("x-amz-") || k == "content-md5" || k == "content-encoding") && !signed.contains(k));
+            if let Some((k, _)) = unsigned {
+                return error(req, 403, "AccessDenied", &format!("there were headers present in the request which were not signed: {k}"));
+            }
+        }
+        query.retain(|(k, _)| !PRESIGN_PARAMS.contains(&k.as_str()) && k != SDK_HINT);
         let path = raw_path.trim_start_matches('/');
         let (bucket, raw_key) = path.split_once('/').unwrap_or((path, ""));
         if bucket != self.bucket {
             return error(req, 404, "NoSuchBucket", bucket);
         }
         let key = uri_decode(raw_key);
-        if key.starts_with(".rift/") {
+        if !valid_key(&key) {
+            return error(req, 400, "InvalidRequest", "keys may not start with '/' or hold empty, '.' or '..' segments");
+        }
+        if internal(&key) {
             return error(req, 403, "AccessDenied", "reserved for rift");
         }
-        let has = |name: &str| query.iter().any(|(k, _)| k == name);
-        match method {
-            "GET" | "HEAD" if !key.is_empty() && query.is_empty() => {
+        let copy_source = header("x-amz-copy-source");
+        let Some(op) = operation(method, &key, &query, copy_source.is_some()) else {
+            return error(req, 501, "NotImplemented", "rift passes on only the requests registries make");
+        };
+        // a body only where one is meant: a GET or a presigned URL can't make rift buffer one
+        let body = req.body_length().is_some_and(|n| n > 0) || header("transfer-encoding").is_some();
+        if body && (presigned || matches!(op, Op::Get | Op::List | Op::Uploads | Op::Location | Op::HeadBucket | Op::Parts | Op::Delete | Op::Abort)) {
+            return error(req, 400, "InvalidRequest", "this request can't carry a body");
+        }
+        match op {
+            Op::Get => {
                 if blob_digest(&key).is_some() {
                     self.reads.lock().unwrap().insert(key.clone(), unix_now());
                 }
+                // response-content-type and friends, as S3 applies them
+                let overrides: Vec<(String, String)> =
+                    query.iter().filter_map(|(k, v)| Some((k.strip_prefix("response-")?.to_string(), v.clone()))).collect();
                 match self.store.info(&key) {
                     Some(_) if !self.store.is_hot(&key) => match self.store.manifest(&key) {
-                        Ok(Some(m)) => self.serve_compacted(req, method, &m, header("range")),
+                        Ok(Some(m)) => self.serve_compacted(req, method, &m, header("range"), &overrides),
                         Ok(None) => self.forward(req, method, &key, &query, &headers, After::Nothing, seed),
                         Err(e) => error(req, 500, "InternalError", &format!("loading the manifest: {e:#}")),
                     },
                     // stored as it is: a client following a presigned URL fetches it from the backend directly
                     _ => match &self.redirect {
-                        Some(endpoint) if presigned && method == "GET" => self.redirect_to_backend(req, &key, endpoint),
+                        Some(endpoint) if presigned && method == "GET" && overrides.is_empty() => {
+                            self.redirect_to_backend(req, &key, endpoint)
+                        }
                         _ => self.forward(req, method, &key, &query, &headers, After::Nothing, seed),
                     },
                 }
             }
-            // ListObjects V1 or V2 (old registries stat files with V1 listings)
-            "GET" if key.is_empty() && !query.iter().any(|(k, _)| BUCKET_SUBRESOURCES.contains(&k.as_str())) => {
-                self.forward(req, method, &key, &query, &headers, After::RewriteList, seed)
-            }
-            "PUT" if !key.is_empty() && header("x-amz-copy-source").is_some() => self.copy(req, &key, &query, &headers, seed),
-            _ => {
-                // requests that create, replace or delete an object end its compacted form
-                let changes = !key.is_empty()
-                    && match method {
-                        "PUT" | "DELETE" => !has("uploadId"),
-                        "POST" => has("uploadId"),
-                        _ => false,
-                    };
-                let after = if changes { After::Forget(vec![key.clone()]) } else { After::Nothing };
-                self.forward(req, method, &key, &query, &headers, after, seed)
+            // old registries stat files with V1 listings
+            Op::List => self.forward(req, method, &key, &query, &headers, After::RewriteList, seed),
+            Op::Copy => self.copy(req, &key, &query, &headers, seed),
+            Op::Part if copy_source.is_some() => self.copy(req, &key, &query, &headers, seed),
+            // these replace or delete the object, and with it its compacted form
+            Op::Put | Op::Complete | Op::Delete => self.forward(req, method, &key, &query, &headers, After::Forget(vec![key.clone()]), seed),
+            Op::DeleteMany => self.forward(req, method, &key, &query, &headers, After::ForgetDeleted, seed),
+            Op::Uploads | Op::Location | Op::HeadBucket | Op::Parts | Op::Part | Op::Create | Op::Abort => {
+                self.forward(req, method, &key, &query, &headers, After::Nothing, seed)
             }
         }
     }
@@ -551,7 +668,7 @@ impl Gateway {
         key: &str,
         query: &[(String, String)],
         headers: &[(String, String)],
-        mut after: After,
+        after: After,
         seed: Option<&sigv4::Seed>,
     ) -> Result<()> {
         if req.body_length().is_some_and(|n| n > self.max_body) {
@@ -564,7 +681,9 @@ impl Gateway {
         }
         let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
         let payload = header("x-amz-content-sha256").unwrap_or("");
-        let chunked = payload.starts_with("STREAMING-") || header("content-encoding").is_some_and(|v| v.contains("aws-chunked"));
+        // only the signed payload hash says the body is aws-chunked: an unsigned Content-Encoding
+        // could otherwise turn the hash check off
+        let chunked = payload.starts_with("STREAMING-");
         let mut trailers = Vec::new();
         if chunked {
             // signed streaming uploads chain each chunk's signature from the request's
@@ -583,8 +702,11 @@ impl Gateway {
         } else if payload.len() == 64 && payload.bytes().all(|b| b.is_ascii_hexdigit()) && sigv4::sha256_hex(&body) != payload.to_ascii_lowercase() {
             return error(req, 400, "XAmzContentSHA256Mismatch", "the body doesn't match its signed hash");
         }
-        if key.is_empty() && query.iter().any(|(k, _)| k == "delete") {
-            after = After::Forget(xml_all(&String::from_utf8_lossy(&body), "Key").into_iter().map(xml_unescape).collect());
+        if matches!(after, After::ForgetDeleted) {
+            let keys: Vec<String> = xml_all(&String::from_utf8_lossy(&body), "Key").into_iter().map(xml_unescape).collect();
+            if keys.iter().any(|k| !valid_key(k) || internal(k)) {
+                return error(req, 403, "AccessDenied", "a key to delete is rift's or isn't one rift passes on");
+            }
         }
         let rest = if key.is_empty() { String::new() } else { Backend::key_path(key) };
         add(&METRICS.passthrough, 1);
@@ -615,6 +737,19 @@ impl Gateway {
                 return Ok(());
             }
             After::Forget(keys) if ok => keys.iter().for_each(|k| self.store.forget(k)),
+            After::ForgetDeleted if status == 200 => {
+                let xml = resp.text()?;
+                for deleted in xml_all(&xml, "Deleted") {
+                    if let Some(k) = s3::xml_first(deleted, "Key") {
+                        self.store.forget(&xml_unescape(k));
+                    }
+                }
+                let mut out = Response::from_data(xml).with_status_code(200);
+                for x in back {
+                    out.add_header(x);
+                }
+                return send(req, out, "pass");
+            }
             _ => {}
         }
         let len = resp.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse::<usize>().ok());
@@ -625,7 +760,7 @@ impl Gateway {
         Ok(())
     }
 
-    fn serve_compacted(&self, req: Request, method: &str, m: &Arc<Manifest>, range: Option<String>) -> Result<()> {
+    fn serve_compacted(&self, req: Request, method: &str, m: &Arc<Manifest>, range: Option<String>, overrides: &[(String, String)]) -> Result<()> {
         let (start, end, partial) = match range.as_deref().map(|r| parse_range(r, m.size)) {
             None => (0, m.size, false),
             Some(Some((s, e))) => (s, e, true),
@@ -639,6 +774,12 @@ impl Gateway {
         ];
         if partial {
             headers.push(h("content-range", &format!("bytes {start}-{}/{}", end - 1, m.size)));
+        }
+        for (name, value) in overrides {
+            if matches!(name.as_str(), "content-type" | "content-language" | "expires" | "cache-control" | "content-disposition" | "content-encoding") {
+                headers.retain(|x| !x.field.as_str().as_str().eq_ignore_ascii_case(name));
+                headers.push(h(name, value));
+            }
         }
         let status = StatusCode(if partial { 206 } else { 200 });
         let len = Some((end - start) as usize);
@@ -728,6 +869,9 @@ impl Gateway {
         let (src_bucket, src_key) = source.trim_start_matches('/').split_once('/').unwrap_or(("", ""));
         if src_bucket != self.bucket {
             return error(req, 400, "InvalidRequest", "copies only within the bucket");
+        }
+        if !valid_key(src_key) || internal(src_key) {
+            return error(req, 403, "AccessDenied", "can't copy from there");
         }
         let part = query.iter().any(|(k, _)| k == "partNumber");
         let source_manifest = match self.store.manifest(src_key) {
@@ -1143,6 +1287,69 @@ mod tests {
         let body = client.get(format!("https://localhost:{}/", addr.port())).send().unwrap().text().unwrap();
         assert_eq!(body, "ok");
         answer.join().unwrap();
+    }
+
+    #[test]
+    fn passes_on_only_what_registries_ask() {
+        let q = |s: &str| parse_query(s);
+        let op = |m: &str, k: &str, query: &str| operation(m, k, &q(query), false);
+        assert_eq!(op("GET", "", "list-type=2&prefix=docker/&delimiter=/&max-keys=1000"), Some(Op::List));
+        assert_eq!(op("GET", "", "prefix=a&marker=b&max-keys=1"), Some(Op::List), "V1, as distribution 2.8 stats");
+        assert_eq!(op("GET", "", "uploads&prefix=docker/"), Some(Op::Uploads));
+        assert_eq!(op("POST", "", "delete"), Some(Op::DeleteMany));
+        assert_eq!(op("GET", "k", ""), Some(Op::Get));
+        assert_eq!(op("GET", "k", "response-content-type=text/plain"), Some(Op::Get));
+        assert_eq!(op("GET", "k", "uploadId=u&max-parts=100"), Some(Op::Parts));
+        assert_eq!(op("PUT", "k", ""), Some(Op::Put));
+        assert_eq!(operation("PUT", "k", &[], true), Some(Op::Copy));
+        assert_eq!(op("PUT", "k", "partNumber=1&uploadId=u"), Some(Op::Part));
+        assert_eq!(op("POST", "k", "uploads"), Some(Op::Create));
+        assert_eq!(op("POST", "k", "uploadId=u"), Some(Op::Complete));
+        assert_eq!(op("DELETE", "k", ""), Some(Op::Delete));
+        assert_eq!(op("DELETE", "k", "uploadId=u"), Some(Op::Abort));
+        // what rift refuses: metadata that would drop a compacted blob, bucket configuration, versions
+        for (m, k, query) in [
+            ("PUT", "k", "tagging"),
+            ("DELETE", "k", "tagging"),
+            ("PUT", "k", "acl"),
+            ("PUT", "k", "retention"),
+            ("PUT", "k", "legal-hold"),
+            ("DELETE", "k", "versionId=v"),
+            ("GET", "k", "versionId=v"),
+            ("GET", "k", "partNumber=1"),
+            ("GET", "", "versions"),
+            ("PUT", "", "policy"),
+            ("PUT", "", "lifecycle"),
+            ("GET", "", "acl"),
+            ("POST", "k", "select&select-type=2"),
+            ("POST", "k", "restore"),
+        ] {
+            assert_eq!(op(m, k, query), None, "{m} {k}?{query}");
+        }
+    }
+
+    #[test]
+    fn keys_rift_refuses() {
+        assert!(valid_key("docker/registry/v2/blobs/sha256/ab/abcd/data"));
+        assert!(valid_key("a/b/"), "a trailing slash is a key like any other");
+        for k in ["/.rift/packs/0", "a//b", "./a", "a/../b", "a/.", ".."] {
+            assert!(!valid_key(k), "{k}");
+        }
+        assert!(internal(".rift/m/x") && internal(".rift") && !internal(".riftx/a") && !internal("a/.rift/b"));
+    }
+
+    #[test]
+    fn listings_hide_rift_data() {
+        let xml = "<ListBucketResult><KeyCount>4</KeyCount>\
+            <Contents><Key>docker/a</Key><Size>1</Size></Contents>\
+            <Contents><Key>.rift/packs/00000000.zst</Key><Size>9</Size></Contents>\
+            <Contents><Key>%2Erift%2Fm%2Fx</Key><Size>9</Size></Contents>\
+            <CommonPrefixes><Prefix>.rift/m/</Prefix></CommonPrefixes>\
+            <CommonPrefixes><Prefix>docker/</Prefix></CommonPrefixes></ListBucketResult>";
+        let out = rewrite_list(xml, &|_| None);
+        assert!(!out.contains(".rift") && !out.contains("%2Erift"), "{out}");
+        assert!(out.contains("<Key>docker/a</Key>") && out.contains("<Prefix>docker/</Prefix>"));
+        assert!(out.contains("<KeyCount>1</KeyCount>"), "{out}");
     }
 
     #[test]
