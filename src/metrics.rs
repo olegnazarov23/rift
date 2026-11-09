@@ -12,6 +12,8 @@ pub struct Metrics {
     pub bucket_listed_at: AtomicU64,
     /// problems found in the bucket's settings at start
     pub bucket_warnings: AtomicU64,
+    /// 1 while this gateway is the bucket's compactor
+    pub compactor: AtomicU64,
     // set by the compactor after each round
     pub compacted_blobs: AtomicU64,
     pub compacted_logical_bytes: AtomicU64,
@@ -44,7 +46,7 @@ macro_rules! zero {
 }
 
 pub static METRICS: Metrics = zero!(
-    bucket_logical_bytes, bucket_stored_bytes, bucket_listed_at, bucket_warnings, compacted_blobs, compacted_logical_bytes,
+    bucket_logical_bytes, bucket_stored_bytes, bucket_listed_at, bucket_warnings, compactor, compacted_blobs, compacted_logical_bytes,
     hot_copies, packs, pack_bytes, retired_pack_bytes, compactions, compacted_bytes, compaction_ms,
     compaction_failures, cold_reads, cold_read_bytes, cold_read_ms, cold_read_errors, hot_copies_made,
     hot_copies_cooled, redirects, passthrough, backend_errors, gc_runs, gc_deleted_packs, gc_deleted_bytes,
@@ -77,6 +79,7 @@ pub fn render() -> String {
     );
     put("bucket_listed_timestamp_seconds", "gauge", "When the compactor last listed the bucket.", g(&m.bucket_listed_at));
     put("bucket_setting_warnings", "gauge", "Problems found in the bucket's settings at start; the log says what they are.", g(&m.bucket_warnings));
+    put("compactor", "gauge", "1 while this gateway compacts the bucket (it holds .rift/compactor); the bucket gauges come from it.", g(&m.compactor));
     put("compacted_blobs", "gauge", "Blobs stored compacted.", g(&m.compacted_blobs));
     put("compacted_logical_bytes", "gauge", "Original size of the compacted blobs.", g(&m.compacted_logical_bytes));
     put("hot_copies", "gauge", "Compacted blobs whose original is back in the bucket after a read.", g(&m.hot_copies));

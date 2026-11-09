@@ -24,13 +24,46 @@ pub struct Object {
     pub etag: String,
 }
 
+/// What a HEAD says about an object, rift's stub metadata included.
+pub struct Head {
+    pub size: u64,
+    pub etag: String,
+    /// on a stub: the compacted blob's size and date
+    pub rift_size: Option<u64>,
+    pub rift_mtime: Option<u64>,
+}
+
+impl Head {
+    fn from(resp: &Response) -> Self {
+        let num = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()?.parse().ok());
+        Self {
+            size: num("content-length").unwrap_or(0),
+            etag: header(resp, "etag"),
+            rift_size: num("x-amz-meta-rift-size"),
+            rift_mtime: num("x-amz-meta-rift-mtime"),
+        }
+    }
+
+    /// The empty object rift leaves in a compacted blob's place.
+    pub fn is_stub(&self) -> bool {
+        self.size == 0 && self.rift_size.is_some_and(|n| n > 0)
+    }
+}
+
+/// Whether a response is a stub, read from its headers.
+pub fn stub_of(resp: &Response) -> Option<Head> {
+    let head = Head::from(resp);
+    (resp.status().is_success() && head.is_stub()).then_some(head)
+}
+
 impl Backend {
     pub fn new(endpoint: &str, bucket: &str, region: &str, creds: Credentials) -> Result<Self> {
         let url = reqwest::Url::parse(endpoint).context("backend endpoint")?;
         let host = url.host_str().context("backend endpoint has no host")?;
         let host = url.port().map_or_else(|| host.to_string(), |p| format!("{host}:{p}"));
         Ok(Self {
-            client: Client::builder().timeout(None).build()?,
+            // S3 closes connections idle for about 20 seconds; reusing one it just closed fails
+            client: Client::builder().timeout(None).pool_idle_timeout(std::time::Duration::from_secs(15)).build()?,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             host,
             bucket: bucket.to_string(),
@@ -54,6 +87,26 @@ impl Backend {
         query: &[(String, String)],
         headers: &[(String, String)],
         body: impl Into<reqwest::blocking::Body>,
+    ) -> Result<Response> {
+        let body = body.into();
+        // a GET or HEAD carries nothing that could be lost: if the connection dies under it (the
+        // server closed it as idle just then), it's sent once more
+        if matches!(method, "GET" | "HEAD") && body.as_bytes().is_some_and(|b| b.is_empty()) {
+            match self.send_once(method, rest, query, headers, Vec::new().into()) {
+                Err(e) if e.downcast_ref::<reqwest::Error>().is_some_and(|e| e.is_request() || e.is_connect()) => {}
+                other => return other,
+            }
+        }
+        self.send_once(method, rest, query, headers, body)
+    }
+
+    fn send_once(
+        &self,
+        method: &str,
+        rest: &str,
+        query: &[(String, String)],
+        headers: &[(String, String)],
+        body: reqwest::blocking::Body,
     ) -> Result<Response> {
         let path = format!("/{}{rest}", self.bucket);
         let q = canonical_query(query);
@@ -134,13 +187,51 @@ impl Backend {
 
     /// Size and ETag, or None if there's no such object.
     pub fn head(&self, key: &str) -> Result<Option<(u64, String)>> {
+        Ok(self.head_object(key)?.map(|h| (h.size, h.etag)))
+    }
+
+    /// The object's size, ETag and stub metadata, or None if there's no such object.
+    pub fn head_object(&self, key: &str) -> Result<Option<Head>> {
         let resp = self.send("HEAD", &Self::key_path(key), &[], &[], Vec::new())?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
         }
         let resp = Self::ok(resp, key)?;
-        let size = header(&resp, "content-length").parse().unwrap_or(0);
-        Ok(Some((size, header(&resp, "etag"))))
+        Ok(Some(Head::from(&resp)))
+    }
+
+    /// Body and ETag, or None if there's no such object.
+    pub fn get_opt(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+        let resp = self.send("GET", &Self::key_path(key), &[], &[], Vec::new())?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let resp = Self::ok(resp, key)?;
+        let etag = header(&resp, "etag");
+        Ok(Some((resp.bytes()?.to_vec(), etag)))
+    }
+
+    /// A conditional PUT (`If-None-Match: *` or `If-Match: <etag>` among `headers`): the new ETag,
+    /// or None when the condition failed (the object exists, changed, or is gone).
+    pub fn put_if(&self, key: &str, body: Vec<u8>, headers: &[(String, String)]) -> Result<Option<String>> {
+        Self::condition(self.send("PUT", &Self::key_path(key), &[], headers, body)?, key, headers)
+    }
+
+    /// `put_if` for a file.
+    pub fn put_file_if(&self, key: &str, file: std::fs::File, len: u64, headers: &[(String, String)]) -> Result<Option<String>> {
+        let body = reqwest::blocking::Body::sized(file, len);
+        Self::condition(self.send("PUT", &Self::key_path(key), &[], headers, body)?, key, headers)
+    }
+
+    fn condition(resp: Response, key: &str, headers: &[(String, String)]) -> Result<Option<String>> {
+        // 412: the condition failed; 409: another conditional write raced this one; 404: If-Match
+        // on an object that isn't there
+        let if_match = headers.iter().any(|(k, _)| k == "if-match");
+        match resp.status().as_u16() {
+            412 | 409 => Ok(None),
+            404 if if_match => Ok(None),
+            _ => Ok(Some(header(&Self::ok(resp, key)?, "etag"))),
+        }
     }
 
     /// A presigned GET of `key`, addressed to `endpoint` (the backend as clients reach it).
@@ -399,6 +490,15 @@ pub fn decode_aws_chunked(body: &[u8], seed: Option<&Seed>) -> Result<(Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stubs_by_their_metadata() {
+        let h = |size, rift_size| Head { size, etag: String::new(), rift_size, rift_mtime: None };
+        assert!(h(0, Some(1234)).is_stub());
+        assert!(!h(0, None).is_stub(), "an empty object of the registry's own");
+        assert!(!h(1234, Some(1234)).is_stub(), "the original, back as a hot copy");
+        assert!(!h(0, Some(0)).is_stub());
+    }
 
     #[test]
     fn lifecycle_rules_that_touch_rift() {

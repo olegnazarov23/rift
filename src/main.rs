@@ -4,6 +4,7 @@ mod cas;
 mod creds;
 mod gateway;
 mod index;
+mod lock;
 mod metrics;
 mod registry;
 mod s3;
@@ -71,8 +72,17 @@ struct EjectArgs {
 
 fn eject(args: &EjectArgs) -> Result<()> {
     let backend = s3::Backend::new(&args.backend, &args.bucket, &args.region, creds::Credentials::from_env(&args.region)?)?;
+    if let Some(renewed) = lock::Lock::active(&backend) {
+        bail!(
+            "a gateway is compacting this bucket ({} renewed {}s ago); stop every gateway first",
+            lock::KEY,
+            sigv4::unix_now().saturating_sub(renewed)
+        );
+    }
     let threads = args.threads.unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
-    let store = cas::Store::open(Arc::new(backend), &state_dir(&args.state_dir, &args.bucket)?, 19, 64, threads, 64 << 20)?;
+    // opening the index fails while a gateway on this host uses the same state dir
+    let index = Arc::new(index::Index::open(&state_dir(&args.state_dir, &args.bucket)?.join("index.redb"))?);
+    let store = cas::Store::open(Arc::new(backend), Some(index), 19, 64, threads, 64 << 20)?;
     if !args.yes {
         println!("{} compacted blobs in {}/{} would be put back as they were, then rift's packs deleted.", store.len(), args.backend, args.bucket);
         println!("Stop the gateway first, then run again with --yes.");
@@ -140,6 +150,10 @@ struct GatewayArgs {
     /// Accept unsigned requests, without client keys; only on a loopback address
     #[arg(long)]
     no_client_auth: bool,
+    /// Only serve: another gateway on the bucket (one without this flag) compacts it, cools hot
+    /// copies and collects garbage. Needs no state dir
+    #[arg(long)]
+    serve_only: bool,
     /// Serve HTTPS with this certificate (PEM, with any intermediates)
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<std::path::PathBuf>,
@@ -190,6 +204,21 @@ fn state_dir(given: &Option<std::path::PathBuf>, bucket: &str) -> Result<std::pa
     Ok(cache.join("rift").join(bucket))
 }
 
+/// This gateway's id for the compactor lock, kept in its state dir: a restart takes the lock back
+/// at once instead of waiting for it to go stale.
+fn gateway_id(dir: &Path) -> Result<String> {
+    let path = dir.join("compactor-id");
+    if let Ok(id) = fs::read_to_string(&path)
+        && id.trim().len() == 16
+    {
+        return Ok(id.trim().to_string());
+    }
+    let seed = format!("{}{:?}{:?}", std::process::id(), Instant::now(), std::time::SystemTime::now());
+    let id = format!("{:016x}", u64::from_le_bytes(blake3::hash(seed.as_bytes()).as_bytes()[..8].try_into()?));
+    fs::write(&path, &id).with_context(|| format!("writing {}", path.display()))?;
+    Ok(id)
+}
+
 /// The keys the registry signs with: both or neither, and a secret too long to guess.
 fn client_keys(access: Option<String>, secret: Option<String>) -> Result<Option<(String, String)>> {
     let (access, secret) = (access.filter(|v| !v.is_empty()), secret.filter(|v| !v.is_empty()));
@@ -234,18 +263,40 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
         _ => {}
     }
     let threads = args.threads.unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
-    let dir = state_dir(&args.state_dir, bucket)?;
-    let mut store = cas::Store::open(Arc::new(backend), &dir, args.pack_level, 64, threads, args.manifest_cache_mb << 20)?;
+    let backend = Arc::new(backend);
+    // a gateway that may compact has a chunk index, which only one process can open at a time, so
+    // the id kept next to it is this gateway's alone
+    let (index, id) = if args.serve_only {
+        (None, format!("{:016x}", u64::from_le_bytes(blake3::hash(format!("{}{:?}", std::process::id(), Instant::now()).as_bytes()).as_bytes()[..8].try_into()?)))
+    } else {
+        let dir = state_dir(&args.state_dir, bucket)?;
+        let index = Arc::new(index::Index::open(&dir.join("index.redb")).with_context(|| format!("opening the chunk index in {}", dir.display()))?);
+        (Some(index), gateway_id(&dir)?)
+    };
+    let mut store = cas::Store::open(backend.clone(), index, args.pack_level, 64, threads, args.manifest_cache_mb << 20)?;
     store.max_unpacked = args.max_unpacked_mb << 20;
+    let lock = (!args.serve_only).then(|| {
+        let conditional = lock::conditional_writes(&backend, &id);
+        if !conditional {
+            eprintln!(
+                "rift: warning: the bucket doesn't refuse writes whose If-None-Match fails, so rift can't keep a second compactor out: run exactly one gateway without --serve-only"
+            );
+        }
+        store.create_only.store(conditional, Ordering::Relaxed);
+        lock::Lock::new(backend.clone(), id.clone(), conditional)
+    });
     let store = Arc::new(store);
     eprintln!(
-        "rift gateway on {}{} for {}/{bucket}: {} compacted blobs, compacting after {} cold (looking every {}), client signatures {}, bucket keys from {}",
+        "rift gateway on {}{} for {}/{bucket}: {} compacted blobs, {}, client signatures {}, bucket keys from {}",
         if args.tls_cert.is_some() { "https://" } else { "" },
         args.listen,
         args.backend,
         store.len(),
-        args.cold_after,
-        args.interval,
+        if args.serve_only {
+            "serving only (another gateway compacts)".to_string()
+        } else {
+            format!("compacting after {} cold (looking every {})", args.cold_after, args.interval)
+        },
         if client_keys.is_some() { "checked" } else { "not checked" },
         store.backend.keys_from()
     );
@@ -264,9 +315,24 @@ fn gateway(args: &GatewayArgs) -> Result<()> {
         rewrite_below: args.gc_rewrite_below,
         grace: seconds(&args.gc_grace)?,
     };
+    match &lock {
+        Some(lock) => {
+            if schedule.grace < 120 {
+                eprintln!("rift: warning: with gateways that only serve, keep --gc-grace at 2m or more: they check cached manifests every 30s");
+            }
+            let (store, reads, l) = (store.clone(), reads.clone(), lock.clone());
+            thread::spawn(move || gateway::compactor(store, reads, l, schedule));
+            let l = lock.clone();
+            thread::spawn(move || l.run());
+        }
+        None => {
+            let (store, interval) = (store.clone(), schedule.interval);
+            thread::spawn(move || gateway::serve_only(store, interval));
+        }
+    }
     {
-        let (store, reads) = (store.clone(), reads.clone());
-        thread::spawn(move || gateway::compactor(store, reads, schedule));
+        let (store, reads, lock) = (store.clone(), reads.clone(), lock.clone());
+        thread::spawn(move || gateway::share_reads(store, reads, lock, id));
     }
     let tls = match (&args.tls_cert, &args.tls_key) {
         (Some(c), Some(k)) => Some((

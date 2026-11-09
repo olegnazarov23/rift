@@ -1,6 +1,7 @@
 //! `rift gateway`: the S3 endpoint a registry (or anything else that stores in S3) talks to.
 //! Requests pass through to the backing bucket, re-signed. Blobs the compactor has compacted are
-//! served by rebuilding them, byte-exact; listings show their original sizes.
+//! served by rebuilding them, byte-exact; listings show their original sizes. Several gateways can
+//! serve one bucket; one of them (holding the compactor lock) compacts it.
 
 use std::{
     collections::HashMap,
@@ -17,7 +18,8 @@ use sha2::{Digest, Sha256};
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 
 use crate::{
-    cas::{Manifest, Store, blob_digest},
+    cas::{EMPTY_SHA256, Manifest, Store, blob_digest},
+    lock::Lock,
     metrics::{METRICS, add, set},
     s3::{self, Backend, decode_aws_chunked, xml_all, xml_escape, xml_unescape},
     sigv4::{self, hex, parse_query, unix_now, uri_decode},
@@ -313,8 +315,11 @@ fn back_headers(resp: &reqwest::blocking::Response) -> Vec<Header> {
         .collect()
 }
 
+/// The size and date to list a key with, given its listed size: Some for a compacted blob.
+type Listed<'a> = dyn Fn(&str, u64) -> Option<(u64, u64)> + 'a;
+
 /// Puts compacted blobs' sizes back into a ListObjectsV2 result and hides rift's own objects.
-fn rewrite_list(xml: &str, compacted: &dyn Fn(&str) -> Option<(u64, u64)>) -> String {
+fn rewrite_list(xml: &str, compacted: &Listed) -> String {
     let set = |block: &str, tag: &str, value: &str| {
         let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
         match (block.find(&open), block.find(&close)) {
@@ -336,7 +341,7 @@ fn rewrite_list(xml: &str, compacted: &dyn Fn(&str) -> Option<(u64, u64)>) -> St
         let key = s3::xml_first(block, "Key").map(|k| uri_decode(&xml_unescape(k))).unwrap_or_default();
         if internal(&key) || !valid_key(&key) {
             hidden += 1;
-        } else if let Some((size, mtime)) = compacted(&key) {
+        } else if let Some((size, mtime)) = compacted(&key, s3::xml_first(block, "Size").and_then(|n| n.parse().ok()).unwrap_or(0)) {
             out.push_str(&set(&set(block, "Size", &size.to_string()), "LastModified", &s3::iso(mtime)));
         } else {
             out.push_str(block);
@@ -671,25 +676,18 @@ impl Gateway {
         }
         match op {
             Op::Get => {
-                if blob_digest(&key).is_some() {
-                    self.reads.lock().unwrap().insert(key.clone(), unix_now());
-                }
                 // response-content-type and friends, as S3 applies them
                 let overrides: Vec<(String, String)> =
                     query.iter().filter_map(|(k, v)| Some((k.strip_prefix("response-")?.to_string(), v.clone()))).collect();
-                match self.store.info(&key) {
-                    Some(_) if !self.store.is_hot(&key) => match self.store.manifest(&key) {
-                        Ok(Some(m)) => self.serve_compacted(req, method, &m, header("range"), &overrides),
-                        Ok(None) => self.forward(req, method, &key, &query, &headers, After::Nothing, seed),
-                        Err(e) => failed(req, 500, "InternalError", "couldn't load the blob's manifest", &key, &e),
-                    },
-                    // stored as it is: a client following a presigned URL fetches it from the backend directly
-                    _ => match &self.redirect {
-                        Some(endpoint) if presigned && method == "GET" && overrides.is_empty() => {
-                            self.redirect_to_backend(req, &key, endpoint)
-                        }
-                        _ => self.forward(req, method, &key, &query, &headers, After::Nothing, seed),
-                    },
+                if blob_digest(&key).is_some() {
+                    self.reads.lock().unwrap().insert(key.clone(), unix_now());
+                    return self.get_blob(req, method, &key, &query, &headers, &overrides, presigned);
+                }
+                // only blobs are ever compacted: a client following a presigned URL fetches anything
+                // else from the backend directly
+                match &self.redirect {
+                    Some(endpoint) if presigned && method == "GET" && overrides.is_empty() => self.redirect_to_backend(req, &key, endpoint),
+                    _ => self.forward(req, method, &key, &query, &headers, After::Nothing, seed),
                 }
             }
             // old registries stat files with V1 listings
@@ -772,7 +770,7 @@ impl Gateway {
         match after {
             After::RewriteList if status == 200 => {
                 let xml = resp.text()?;
-                let body = rewrite_list(&xml, &|k| self.store.info(k).map(|i| (i.size, i.mtime)));
+                let body = rewrite_list(&xml, &|k, listed| self.listed(k, listed));
                 let mut out = Response::from_data(body).with_status_code(200);
                 for x in back {
                     out.add_header(x);
@@ -802,6 +800,98 @@ impl Gateway {
         }
         send(req, sized(StatusCode(status), back, resp, len), "pass")?;
         Ok(())
+    }
+
+    /// GET or HEAD of a registry blob. What the bucket holds decides: a stub means the blob is
+    /// compacted and is rebuilt from its manifest; anything else is passed on. What this gateway
+    /// remembers only saves lookups, since another gateway may have compacted, cooled or deleted
+    /// the blob meanwhile.
+    #[allow(clippy::too_many_arguments)]
+    fn get_blob(
+        &self,
+        req: Request,
+        method: &str,
+        key: &str,
+        query: &[(String, String)],
+        headers: &[(String, String)],
+        overrides: &[(String, String)],
+        presigned: bool,
+    ) -> Result<()> {
+        let range = headers.iter().find(|(k, _)| k == "range").map(|(_, v)| v.clone());
+        // a redirect sends the client to the bucket itself, which mustn't hand it a stub
+        if let Some(endpoint) = self.redirect.as_deref().filter(|_| presigned && method == "GET" && overrides.is_empty()) {
+            match self.store.backend.head_object(key) {
+                Ok(Some(h)) if h.is_stub() => return self.serve_stub(req, method, key, &h, range, overrides),
+                Ok(Some(_)) => return self.redirect_to_backend(req, key, endpoint),
+                Ok(None) => {} // the bucket's 404 follows
+                Err(e) => return failed(req, 502, "BadGateway", "the bucket didn't answer", key, &e),
+            }
+        }
+        // a condition would be checked against the stub, not the blob
+        let pass: Vec<(String, String)> = pass_headers(headers, false).into_iter().filter(|(k, _)| !k.starts_with("if-")).collect();
+        add(&METRICS.passthrough, 1);
+        let resp = match self.store.backend.send(method, &Backend::key_path(key), query, &pass, Vec::new()) {
+            Ok(r) => r,
+            Err(e) => {
+                add(&METRICS.backend_errors, 1);
+                return failed(req, 502, "BadGateway", "the bucket didn't answer", key, &e);
+            }
+        };
+        if let Some(stub) = s3::stub_of(&resp) {
+            return self.serve_stub(req, method, key, &stub, range, overrides);
+        }
+        let status = resp.status().as_u16();
+        // no range of a stub is satisfiable: see what's there
+        if status == 416
+            && range.is_some()
+            && let Ok(Some(h)) = self.store.backend.head_object(key)
+            && h.is_stub()
+        {
+            return self.serve_stub(req, method, key, &h, range, overrides);
+        }
+        if status >= 500 {
+            add(&METRICS.backend_errors, 1);
+        }
+        let back = back_headers(&resp);
+        let len = resp.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse::<usize>().ok());
+        send(req, sized(StatusCode(status), back, resp, len), "pass")
+    }
+
+    /// The manifest of the blob a stub stands for; None if the bucket has none (it must never be
+    /// served as the blob).
+    fn stub_manifest(&self, key: &str, stub: &s3::Head) -> Result<Option<Arc<Manifest>>> {
+        match self.store.resolve(key, stub.rift_size.unwrap_or(0), stub.rift_mtime)? {
+            Some(info) => self.store.manifest_for(key, info),
+            None => Ok(None),
+        }
+    }
+
+    /// Serves the blob the bucket holds a stub of.
+    fn serve_stub(&self, req: Request, method: &str, key: &str, stub: &s3::Head, range: Option<String>, overrides: &[(String, String)]) -> Result<()> {
+        match self.stub_manifest(key, stub) {
+            Ok(Some(m)) => {
+                self.store.clear_hot(key);
+                self.serve_compacted(req, method, &m, range, overrides)
+            }
+            Ok(None) => {
+                eprintln!("rift: {}: the bucket holds a stub but no manifest for it", printable(key));
+                error(req, 500, "InternalError", "the blob's stored form is missing")
+            }
+            Err(e) => failed(req, 502, "BadGateway", "couldn't load the blob's manifest", key, &e),
+        }
+    }
+
+    /// The size and date a listing shows for a compacted blob: from what this gateway knows, or,
+    /// for an empty object at a blob's key (the stub of a blob compacted through another gateway?),
+    /// from its manifest's name.
+    fn listed(&self, key: &str, listed: u64) -> Option<(u64, u64)> {
+        let info = match self.store.info(key) {
+            Some(i) if listed == 0 || listed == i.size => Some(i),
+            Some(_) => None, // another blob is there now
+            None if listed == 0 && blob_digest(key).is_some_and(|d| d != EMPTY_SHA256) => self.store.resolve_listed(key).ok().flatten(),
+            None => None,
+        };
+        info.map(|i| (i.size, i.mtime))
     }
 
     fn serve_compacted(&self, req: Request, method: &str, m: &Arc<Manifest>, range: Option<String>, overrides: &[(String, String)]) -> Result<()> {
@@ -918,9 +1008,15 @@ impl Gateway {
             return error(req, 403, "AccessDenied", "can't copy from there");
         }
         let part = query.iter().any(|(k, _)| k == "partNumber");
-        let source_manifest = match self.store.manifest(src_key) {
-            Ok(m) => m,
-            Err(e) => return failed(req, 500, "InternalError", "couldn't load the source's manifest", src_key, &e),
+        // a compacted source is rebuilt: the bucket says which (only blobs are ever compacted)
+        let source_manifest = match blob_digest(src_key).map(|_| self.store.backend.head_object(src_key)) {
+            Some(Ok(Some(h))) if h.is_stub() => match self.stub_manifest(src_key, &h) {
+                Ok(Some(m)) => Some(m),
+                Ok(None) => return error(req, 500, "InternalError", "the source's stored form is missing"),
+                Err(e) => return failed(req, 500, "InternalError", "couldn't load the source's manifest", src_key, &e),
+            },
+            Some(Err(e)) => return failed(req, 502, "BadGateway", "the bucket didn't answer", src_key, &e),
+            _ => None,
         };
         if let Some(m) = source_manifest {
             if part {
@@ -990,18 +1086,121 @@ fn sweep_spills(dir: &std::path::Path) {
     }
 }
 
-/// Every `interval` (the first round within a minute of starting): lists the bucket, stubs idle hot
-/// copies again, compacts cold blobs, then reclaims chunks of deleted ones (always on the first
-/// round, to clear packs an interrupted run left behind).
-pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, s: Schedule) {
+/// Where gateways that don't compact leave the blobs they served, for the compactor.
+const READS: &str = ".rift/reads/";
+
+fn format_reads(reads: &HashMap<String, u64>) -> Vec<u8> {
+    reads.iter().map(|(k, t)| format!("{t}\t{k}\n")).collect::<String>().into_bytes()
+}
+
+fn parse_reads(body: &[u8]) -> Vec<(String, u64)> {
+    String::from_utf8_lossy(body)
+        .lines()
+        .filter_map(|l| {
+            let (t, k) = l.split_once('\t')?;
+            Some((k.to_string(), t.parse().ok()?))
+        })
+        .collect()
+}
+
+fn merge_reads(into: &mut HashMap<String, u64>, from: impl IntoIterator<Item = (String, u64)>) {
+    for (k, t) in from {
+        let last = into.entry(k).or_insert(t);
+        *last = (*last).max(t);
+    }
+}
+
+/// Every minute, hands the blobs this gateway served to the compactor (unless it is the
+/// compactor), so `--cold-after` counts reads on every gateway.
+pub fn share_reads(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, lock: Option<Arc<Lock>>, id: String) {
+    loop {
+        thread::sleep(Duration::from_secs(60));
+        if lock.as_ref().is_some_and(|l| l.holding()) {
+            continue;
+        }
+        let batch = std::mem::take(&mut *reads.lock().unwrap());
+        if batch.is_empty() {
+            continue;
+        }
+        let millis = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        if let Err(e) = store.backend.put(&format!("{READS}{millis:013}-{id}"), format_reads(&batch), &[]) {
+            eprintln!("rift: handing reads to the compactor: {e:#}");
+            merge_reads(&mut reads.lock().unwrap(), batch);
+        }
+    }
+}
+
+/// Takes in the reads other gateways handed over.
+fn take_reads(store: &Store, reads: &Mutex<HashMap<String, u64>>) {
+    let listed = match store.backend.list(READS) {
+        Ok(l) => l,
+        Err(e) => return eprintln!("rift: reading other gateways' reads: {e:#}"),
+    };
+    for o in listed {
+        match store.backend.get_opt(&o.key) {
+            Ok(Some((body, _))) => merge_reads(&mut reads.lock().unwrap(), parse_reads(&body)),
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("rift: reading {}: {e:#}", o.key);
+                continue;
+            }
+        }
+        if let Err(e) = store.backend.delete(&o.key) {
+            eprintln!("rift: deleting {}: {e:#}", o.key);
+        }
+    }
+}
+
+/// A gateway that only serves reads the catalog afresh every `interval`, for listings (a blob
+/// compacted since is found from its stub anyway), and clears temp files a killed rift left.
+pub fn serve_only(store: Arc<Store>, interval: Duration) {
+    loop {
+        thread::sleep(interval);
+        sweep_spills(&std::env::temp_dir());
+        match store.refresh_catalog() {
+            Ok(()) => store.publish_totals(),
+            Err(e) => eprintln!("rift: reading the catalog: {e:#}"),
+        }
+    }
+}
+
+/// Every `interval` (the first round within a minute of starting), while this gateway holds the
+/// compactor lock: lists the bucket, catches up with what other gateways deleted or replaced,
+/// stubs idle hot copies again, compacts cold blobs, then reclaims chunks of deleted ones (always
+/// on the first round after taking the lock, to clear packs an interrupted run left behind).
+pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, lock: Arc<Lock>, s: Schedule) {
     let (mut first, mut wait) = (true, s.interval.min(Duration::from_secs(60)));
+    // the lock's `taken` count this gateway last got ready for
+    let mut prepared = 0;
+    let go = || lock.holding();
     loop {
         thread::sleep(wait);
         wait = s.interval;
         sweep_spills(&std::env::temp_dir());
+        set(&METRICS.compactor, u64::from(go()));
+        if !go() {
+            // standing by: look again soon, so compaction resumes soon after a takeover
+            wait = s.interval.min(Duration::from_secs(30));
+            store.publish_totals();
+            continue;
+        }
+        if prepared != lock.taken() {
+            if let Err(e) = store.prepare_compaction() {
+                eprintln!("rift: getting ready to compact: {e:#}");
+                wait = s.interval.min(Duration::from_secs(60));
+                continue;
+            }
+            prepared = lock.taken();
+            first = true;
+        }
         match store.backend.list("") {
             Ok(objects) => {
                 let now = unix_now();
+                let gone = store.reconcile(&objects);
+                if gone > 0 {
+                    eprintln!("rift: {gone} compacted blobs were deleted or replaced through other gateways");
+                }
+                take_reads(&store, &reads);
                 let (mut logical, mut stored) = (0u64, 0u64);
                 for o in &objects {
                     stored += o.size;
@@ -1037,15 +1236,18 @@ pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, s: 
                         None => {}
                     }
                 }
-                let cooled = cooling.iter().filter(|(k, etag)| store.cool(k, etag).map_err(|e| eprintln!("rift: cooling {k}: {e:#}")).is_ok()).count();
+                let cooled = cooling
+                    .iter()
+                    .filter(|(k, etag)| go() && store.cool(k, etag).map_err(|e| eprintln!("rift: cooling {k}: {e:#}")).is_ok())
+                    .count();
                 if cooled > 0 {
                     add(&METRICS.hot_copies_cooled, cooled as u64);
                     eprintln!("rift: stubbed {cooled} hot copies again");
                 }
-                if !cold.is_empty() {
+                if !cold.is_empty() && go() {
                     eprintln!("rift: compacting {} cold blobs", cold.len());
                     let started = std::time::Instant::now();
-                    let (done, bytes) = store.compact(&cold, s.threads);
+                    let (done, bytes) = store.compact(&cold, s.threads, &go);
                     add(&METRICS.compactions, done as u64);
                     add(&METRICS.compacted_bytes, bytes);
                     add(&METRICS.compaction_ms, started.elapsed().as_millis() as u64);
@@ -1060,9 +1262,9 @@ pub fn compactor(store: Arc<Store>, reads: Arc<Mutex<HashMap<String, u64>>>, s: 
             }
             Err(e) => eprintln!("rift: compactor can't list the bucket: {e:#}"),
         }
-        if first || store.gc_due() {
+        if go() && (first || store.gc_due()) {
             first = false;
-            let report = store.gc(s.rewrite_below, s.grace);
+            let report = store.gc(s.rewrite_below, s.grace, &go);
             if let Ok(r) = &report {
                 add(&METRICS.gc_runs, 1);
                 add(&METRICS.gc_deleted_packs, r.deleted as u64);
@@ -1127,7 +1329,7 @@ mod tests {
             let _ = s3::parse_iso(&t);
             let _ = s3::decode_aws_chunked(&b, None);
             let _ = s3::decode_aws_chunked(&b, Some(&seed));
-            let _ = rewrite_list(&t, &|k| (k.len() % 2 == 0).then_some((1, 2)));
+            let _ = rewrite_list(&t, &|k, _| (k.len() % 2 == 0).then_some((1, 2)));
             let _ = parse_range(&t, rng.next() % 1000);
             let _ = redact(&t);
             let _ = loggable_url(&t);
@@ -1391,7 +1593,7 @@ mod tests {
             <Contents><Key>%2Erift%2Fm%2Fx</Key><Size>9</Size></Contents>\
             <CommonPrefixes><Prefix>.rift/m/</Prefix></CommonPrefixes>\
             <CommonPrefixes><Prefix>docker/</Prefix></CommonPrefixes></ListBucketResult>";
-        let out = rewrite_list(xml, &|_| None);
+        let out = rewrite_list(xml, &|_, _| None);
         assert!(!out.contains(".rift") && !out.contains("%2Erift"), "{out}");
         assert!(out.contains("<Key>docker/a</Key>") && out.contains("<Prefix>docker/</Prefix>"));
         assert!(out.contains("<KeyCount>1</KeyCount>"), "{out}");
@@ -1430,10 +1632,20 @@ mod tests {
     #[test]
     fn list_rewrite() {
         let xml = "<ListBucketResult><KeyCount>3</KeyCount><Contents><Key>a/data</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><Size>0</Size></Contents><Contents><Key>.rift/m/x</Key><Size>5</Size></Contents><Contents><Key>b</Key><Size>7</Size></Contents></ListBucketResult>";
-        let out = rewrite_list(xml, &|k| (k == "a/data").then_some((1234, 1_369_353_600)));
+        // the stub's listed size goes along, so a key holding another blob now isn't misreported
+        let out = rewrite_list(xml, &|k, listed| (k == "a/data" && listed == 0).then_some((1234, 1_369_353_600)));
         assert!(out.contains("<Key>a/data</Key><LastModified>2013-05-24T00:00:00.000Z</LastModified><Size>1234</Size>"));
         assert!(!out.contains(".rift/"));
         assert!(out.contains("<Key>b</Key><Size>7</Size>"));
         assert!(out.contains("<KeyCount>2</KeyCount>"));
+    }
+
+    #[test]
+    fn reads_handed_over() {
+        let mine = HashMap::from([("a/data".to_string(), 100), ("b/data".to_string(), 200)]);
+        let mut theirs = HashMap::from([("a/data".to_string(), 150), ("c/data".to_string(), 50)]);
+        merge_reads(&mut theirs, parse_reads(&format_reads(&mine)));
+        assert_eq!(theirs, HashMap::from([("a/data".into(), 150), ("b/data".into(), 200), ("c/data".into(), 50)]), "latest read wins");
+        assert!(parse_reads(b"garbage\n12\tok\nx\ty\n") == vec![("ok".to_string(), 12)], "bad lines are skipped");
     }
 }

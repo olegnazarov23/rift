@@ -13,9 +13,10 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use fastcdc::v2020::FastCDC;
 use preflate_rs::{ExitCode, IndependentRecipe, PreflateConfig, RebuiltGroup, Splicer, preflate_independent};
 use serde_json::{Value, json};
@@ -25,7 +26,7 @@ use zstd::stream::raw::CParameter;
 pub use crate::index::{Entry, Ref};
 use crate::{
     index::Index,
-    s3::Backend,
+    s3::{Backend, Object},
     sigv4::{hex, sha256_hex, unix_now},
     store::gzip_payload_offset,
 };
@@ -41,6 +42,11 @@ const MAGIC: &[u8; 8] = b"riftman1";
 pub const MAX_RATIO: u64 = 100;
 /// Compactions of one blob that may die (rift killed, say out of memory) before it's left as it is.
 const MAX_TRIES: u64 = 2;
+/// A cached manifest older than this is checked against the bucket before use: GC may have pointed
+/// it at new packs, and the old ones are deleted after --gc-grace.
+const REVALIDATE: Duration = Duration::from_secs(30);
+/// The sha256 of nothing: an empty blob, never a stub.
+pub const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 
 pub struct Manifest {
@@ -432,9 +438,12 @@ impl Packer {
     }
 }
 
+/// A cached manifest: its object's ETag, and when that was last checked against the bucket.
+type CachedManifest = (Arc<Manifest>, String, Instant);
+
 /// Manifests loaded from the bucket, least recently used dropped past a byte budget.
 pub struct ManifestCache {
-    inner: Mutex<(HashMap<String, (Arc<Manifest>, u64)>, usize, u64)>,
+    inner: Mutex<(HashMap<String, (CachedManifest, u64)>, usize, u64)>,
     cap: usize,
 }
 
@@ -443,37 +452,50 @@ impl ManifestCache {
         Self { inner: Mutex::new((HashMap::new(), 0, 0)), cap }
     }
 
-    pub fn get(&self, key: &str) -> Option<Arc<Manifest>> {
+    pub fn get(&self, key: &str) -> Option<CachedManifest> {
         let mut g = self.inner.lock().unwrap();
         g.2 += 1;
         let tick = g.2;
-        g.0.get_mut(key).map(|(m, used)| {
+        g.0.get_mut(key).map(|(c, used)| {
             *used = tick;
-            m.clone()
+            c.clone()
         })
     }
 
-    pub fn insert(&self, m: Arc<Manifest>) {
+    pub fn insert(&self, m: Arc<Manifest>, etag: String) {
         let mut g = self.inner.lock().unwrap();
         let (map, total, tick) = &mut *g;
         *tick += 1;
         *total += m.bytes();
-        if let Some((old, _)) = map.insert(m.key.clone(), (m, *tick)) {
+        if let Some(((old, ..), _)) = map.insert(m.key.clone(), ((m, etag, Instant::now()), *tick)) {
             *total -= old.bytes();
         }
         while *total > self.cap && map.len() > 1 {
             let oldest = map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k.clone()).expect("not empty");
-            if let Some((gone, _)) = map.remove(&oldest) {
+            if let Some(((gone, ..), _)) = map.remove(&oldest) {
                 *total -= gone.bytes();
             }
         }
     }
 
+    /// The bucket still holds this version of the manifest.
+    fn checked(&self, key: &str) {
+        if let Some(((_, _, at), _)) = self.inner.lock().unwrap().0.get_mut(key) {
+            *at = Instant::now();
+        }
+    }
+
     pub fn remove(&self, key: &str) {
         let mut g = self.inner.lock().unwrap();
-        if let Some((gone, _)) = g.0.remove(key) {
+        if let Some(((gone, ..), _)) = g.0.remove(key) {
             g.1 -= gone.bytes();
         }
+    }
+
+    pub fn clear(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.0.clear();
+        g.1 = 0;
     }
 }
 
@@ -659,24 +681,30 @@ pub fn stream(m: &Manifest, start: u64, end: u64, workers: usize, pack: &PackFn,
 }
 
 /// What's kept in memory per compacted blob; its manifest is loaded when needed.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BlobInfo {
     pub size: u64,
     pub mtime: u64,
 }
 
-/// The compacted blobs of one bucket.
+/// The compacted blobs of one bucket. Several gateways can serve a bucket while one of them
+/// compacts it (it alone has the index and a packer). A stub names its blob's manifest, so what a
+/// gateway knows of the catalog only saves it lookups: the bucket is what counts.
 pub struct Store {
     pub backend: Arc<Backend>,
-    index: Arc<Index>,
+    /// the chunk index, on a gateway that may compact
+    index: Option<Arc<Index>>,
+    level: i32,
+    threads: usize,
     /// the most a blob may unpack to for compaction; it holds the blob and its plain text in memory
     pub max_unpacked: u64,
     kept: Kept,
     cache: PackCache,
-    /// every compacted blob; listing the manifests' names rebuilds this
+    /// compacted blobs this gateway knows of; listing the manifests' names rebuilds this
     compacted: RwLock<HashMap<String, BlobInfo>>,
     manifests: ManifestCache,
-    packer: Mutex<Packer>,
+    /// set up by `prepare_compaction`, once this gateway is the compactor
+    packer: Mutex<Option<Packer>>,
     /// held while a manifest is added, replaced or removed
     mutations: Mutex<()>,
     /// packs nothing refers to any more: (id, when, stored size); deleted after a grace period
@@ -687,6 +715,9 @@ pub struct Store {
     hot: Mutex<HashMap<String, u64>>,
     /// blobs being copied back right now
     copying: Mutex<HashSet<String>>,
+    /// the bucket honours `If-None-Match: *`: packs and manifests are written only where nothing
+    /// is, so a second compactor fails rather than overwrite
+    pub create_only: AtomicBool,
 }
 
 #[derive(Default)]
@@ -717,18 +748,93 @@ fn parse_manifest_key(name: &str) -> Option<(String, BlobInfo)> {
     Some((key.to_string(), BlobInfo { size: size.parse().ok()?, mtime: mtime.parse().ok()? }))
 }
 
+/// Compacted blobs by their manifests' names; of two manifests for one key, the later blob's.
+fn manifest_names(objects: &[Object]) -> HashMap<String, BlobInfo> {
+    let mut out: HashMap<String, BlobInfo> = HashMap::new();
+    for (key, info) in objects.iter().filter_map(|o| parse_manifest_key(&o.key)) {
+        let known = out.entry(key).or_insert(info);
+        if info.mtime > known.mtime {
+            *known = info;
+        }
+    }
+    out
+}
+
+/// What a stub carries: its blob's size and date, and the version it replaces.
+fn stub_headers(info: BlobInfo, etag: &str) -> Vec<(String, String)> {
+    vec![
+        ("x-amz-meta-rift-size".into(), info.size.to_string()),
+        ("x-amz-meta-rift-mtime".into(), info.mtime.to_string()),
+        ("if-match".into(), etag.to_string()),
+    ]
+}
+
 impl Store {
-    /// Opens the chunk index in `state_dir` (rebuilt from the bucket's .idx files when it doesn't
-    /// match the packs there) and loads the catalog of compacted blobs.
+    /// Loads the catalog of compacted blobs. `index` is the chunk index of a gateway that may
+    /// compact (`prepare_compaction` brings it up to date); without one, the gateway only serves.
     pub fn open(
         backend: Arc<Backend>,
-        state_dir: &std::path::Path,
+        index: Option<Arc<Index>>,
         level: i32,
         cache_packs: usize,
         threads: usize,
         manifest_cache: usize,
     ) -> Result<Self> {
-        let listing = backend.list(PACKS)?;
+        let store = Self {
+            backend,
+            index,
+            level,
+            threads,
+            max_unpacked: 2 << 30,
+            kept: Kept::default(),
+            cache: PackCache::new(cache_packs),
+            compacted: RwLock::new(HashMap::new()),
+            manifests: ManifestCache::new(manifest_cache),
+            packer: Mutex::new(None),
+            mutations: Mutex::new(()),
+            retired: Mutex::new(Vec::new()),
+            forgotten: AtomicUsize::new(0),
+            hot: Mutex::new(HashMap::new()),
+            copying: Mutex::new(HashSet::new()),
+            create_only: AtomicBool::new(false),
+        };
+        store.refresh_catalog()?;
+        Ok(store)
+    }
+
+    /// Reads the catalog afresh from the manifests' names, so what was compacted, forgotten or
+    /// collected through other gateways shows.
+    pub fn refresh_catalog(&self) -> Result<()> {
+        let fresh = manifest_names(&self.backend.list(MANIFESTS)?);
+        self.replace_catalog(fresh);
+        Ok(())
+    }
+
+    /// Returns how many known blobs have no manifest any more.
+    fn replace_catalog(&self, fresh: HashMap<String, BlobInfo>) -> usize {
+        let (changed, gone): (Vec<String>, usize) = {
+            let _m = self.mutations.lock().unwrap();
+            let mut c = self.compacted.write().unwrap();
+            let changed = c.iter().filter(|(k, i)| fresh.get(*k) != Some(*i)).map(|(k, _)| k.clone()).collect();
+            let gone = c.keys().filter(|k| !fresh.contains_key(*k)).count();
+            *c = fresh;
+            (changed, gone)
+        };
+        for key in &changed {
+            self.manifests.remove(key);
+            self.hot.lock().unwrap().remove(key);
+        }
+        gone
+    }
+
+    /// Gets this gateway ready to compact, once it's the compactor: deletes halves of packs an
+    /// interrupted store left behind, brings the chunk index up to date with the packs in the
+    /// bucket (another compactor may have added some), renames old-style manifests and starts a
+    /// packer after the last pack. Packs retired earlier aren't remembered (another compactor may
+    /// have used them since): GC finds what's unused again.
+    pub fn prepare_compaction(&self) -> Result<()> {
+        let index = self.index.clone().context("this gateway only serves")?;
+        let listing = self.backend.list(PACKS)?;
         let name = |key: &str| -> Option<(u32, String)> {
             let (id, ext) = key.strip_prefix(PACKS)?.split_once('.')?;
             Some((id.parse().ok()?, ext.to_string()))
@@ -750,52 +856,70 @@ impl Store {
         }
         // half a pack is one whose store failed: nothing can refer to it
         for id in zst.keys().filter(|id| !idx.contains(id)).copied().collect::<Vec<_>>() {
-            backend.delete(&pack_key(id))?;
+            self.backend.delete(&pack_key(id))?;
             zst.remove(&id);
         }
         for id in idx.iter().filter(|id| !zst.contains_key(id)) {
-            backend.delete(&idx_key(*id))?;
+            self.backend.delete(&idx_key(*id))?;
         }
-        let index = Arc::new(Index::open(&state_dir.join("index.redb"))?);
         let mut packs = index.packs()?;
         let in_step = packs.len() == zst.len() && zst.iter().all(|(id, size)| packs.get(id).is_some_and(|p| p.0 == *size));
         if !in_step {
             eprintln!("rift: rebuilding the chunk index from {} packs", zst.len());
             let mut all = Vec::with_capacity(zst.len());
             for (&id, &size) in &zst {
-                all.push((id, size, Self::read_idx(&backend, id)?));
+                all.push((id, size, Self::read_idx(&self.backend, id)?));
             }
             packs = all.iter().map(|(id, size, e)| (*id, (*size, e.iter().map(|x| u64::from(x.2)).sum()))).collect();
             index.rebuild(all)?;
         }
-        let mut compacted = HashMap::new();
-        for o in backend.list(MANIFESTS)? {
-            if let Some((key, info)) = parse_manifest_key(&o.key) {
-                compacted.insert(key, info);
+        self.retired.lock().unwrap().clear();
+        // whoever compacted meanwhile may have pointed manifests at other packs: GC must not go
+        // by copies cached before
+        self.manifests.clear();
+        *self.packer.lock().unwrap() = Some(Packer::new(index, packs, next, self.level, self.threads));
+        // named before sizes went into the name: read once and renamed
+        for o in self.backend.list(MANIFESTS)? {
+            if parse_manifest_key(&o.key).is_some() {
                 continue;
             }
-            // named before sizes went into the name: read it once and rename it
-            let m = Manifest::decode(&backend.get(&o.key)?.0)?;
+            let m = Manifest::decode(&self.backend.get(&o.key)?.0)?;
             let info = BlobInfo { size: m.size, mtime: m.mtime };
-            backend.put(&manifest_key(&m.key, info), m.encode(), &[])?;
-            backend.delete(&o.key)?;
-            compacted.insert(m.key, info);
+            self.backend.put(&manifest_key(&m.key, info), m.encode(), &[])?;
+            self.backend.delete(&o.key)?;
         }
-        Ok(Self {
-            backend,
-            index: index.clone(),
-            max_unpacked: 2 << 30,
-            kept: Kept::default(),
-            cache: PackCache::new(cache_packs),
-            compacted: RwLock::new(compacted),
-            manifests: ManifestCache::new(manifest_cache),
-            packer: Mutex::new(Packer::new(index, packs, next, level, threads)),
-            mutations: Mutex::new(()),
-            retired: Mutex::new(Vec::new()),
-            forgotten: AtomicUsize::new(0),
-            hot: Mutex::new(HashMap::new()),
-            copying: Mutex::new(HashSet::new()),
-        })
+        self.refresh_catalog()
+    }
+
+    /// Brings the catalog in line with a listing of the whole bucket (the compactor's round):
+    /// manifests deleted through other gateways drop out, ones this gateway didn't know come in,
+    /// and blobs deleted or replaced through other gateways have their compacted form forgotten.
+    /// Either way GC is due. Returns how many blobs went.
+    pub fn reconcile(&self, objects: &[Object]) -> usize {
+        let names = manifest_names(objects);
+        // an older manifest of a key that has a newer one is left over
+        for o in objects {
+            if let Some((key, info)) = parse_manifest_key(&o.key)
+                && names.get(&key).is_some_and(|newest| *newest != info)
+                && let Err(e) = self.backend.delete(&o.key)
+            {
+                eprintln!("rift: deleting the old manifest {}: {e:#}", o.key);
+            }
+        }
+        // their chunks may be unused now: GC is due
+        let dropped = self.replace_catalog(names);
+        self.forgotten.fetch_add(dropped, Ordering::Relaxed);
+        let blobs: HashMap<&str, &Object> = objects.iter().filter(|o| !o.key.starts_with(".rift/")).map(|o| (o.key.as_str(), o)).collect();
+        let known: Vec<(String, BlobInfo)> = self.compacted.read().unwrap().iter().map(|(k, i)| (k.clone(), *i)).collect();
+        let mut forgotten = 0;
+        for (key, info) in known {
+            // the stub, or the original back as a hot copy; anything else is another blob now
+            if !blobs.get(key.as_str()).is_some_and(|o| o.size == 0 || o.size == info.size) {
+                self.forget(&key);
+                forgotten += 1;
+            }
+        }
+        dropped + forgotten
     }
 
     fn read_idx(backend: &Backend, id: u32) -> Result<Vec<Entry>> {
@@ -818,20 +942,101 @@ impl Store {
         self.compacted.read().unwrap().get(key).copied()
     }
 
-    /// The manifest of a compacted blob, from the cache or the bucket.
-    pub fn manifest(&self, key: &str) -> Result<Option<Arc<Manifest>>> {
-        let Some(info) = self.info(key) else { return Ok(None) };
-        if let Some(m) = self.manifests.get(key) {
-            return Ok(Some(m));
+    /// The blob behind a stub, from its size and (on stubs since 0.1.5) date: what this gateway
+    /// knows, else the manifest's name in the bucket. None: there's no manifest for it.
+    pub fn resolve(&self, key: &str, size: u64, mtime: Option<u64>) -> Result<Option<BlobInfo>> {
+        if let Some(i) = self.info(key).filter(|i| i.size == size && mtime.is_none_or(|t| t == i.mtime)) {
+            return Ok(Some(i));
         }
-        let m = Arc::new(Manifest::decode(&self.backend.get(&manifest_key(key, info))?.0)?);
-        self.manifests.insert(m.clone());
+        let info = match mtime {
+            Some(mtime) => Some(BlobInfo { size, mtime }),
+            None => self.find_manifest(key, Some(size))?,
+        };
+        if let Some(i) = info {
+            self.learn(key, i);
+        }
+        Ok(info)
+    }
+
+    /// A listing showed an empty object at a blob's key: the stub of a blob compacted elsewhere?
+    pub fn resolve_listed(&self, key: &str) -> Result<Option<BlobInfo>> {
+        let info = self.find_manifest(key, None)?;
+        if let Some(i) = info {
+            self.learn(key, i);
+        }
+        Ok(info)
+    }
+
+    /// A blob's manifest by name, the newest if there are several; `size` narrows the listing.
+    fn find_manifest(&self, key: &str, size: Option<u64>) -> Result<Option<BlobInfo>> {
+        let prefix = match size {
+            Some(n) => format!("{MANIFESTS}{key}@{n}@"),
+            None => format!("{MANIFESTS}{key}@"),
+        };
+        Ok(manifest_names(&self.backend.list(&prefix)?).remove(key))
+    }
+
+    fn learn(&self, key: &str, info: BlobInfo) {
+        let _m = self.mutations.lock().unwrap();
+        if self.compacted.write().unwrap().insert(key.to_string(), info).is_some_and(|old| old != info) {
+            self.manifests.remove(key);
+        }
+    }
+
+    /// Forgets what this gateway knows of a blob whose manifest is gone (deleted through another
+    /// gateway), leaving the bucket as it is. Its chunks may be unused now: GC is due.
+    pub fn drop_local(&self, key: &str) {
+        let _m = self.mutations.lock().unwrap();
+        self.hot.lock().unwrap().remove(key);
+        self.manifests.remove(key);
+        if self.compacted.write().unwrap().remove(key).is_some() {
+            self.forgotten.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The bucket holds the stub again, whatever this gateway thought.
+    pub fn clear_hot(&self, key: &str) {
+        self.hot.lock().unwrap().remove(key);
+    }
+
+    /// A blob's manifest: from the cache (checked against the bucket once it's REVALIDATE old,
+    /// since GC may have pointed it at other packs) or from the bucket. None: the bucket has none.
+    pub fn manifest_for(&self, key: &str, info: BlobInfo) -> Result<Option<Arc<Manifest>>> {
+        let name = manifest_key(key, info);
+        if let Some((m, etag, checked)) = self.manifests.get(key)
+            && m.size == info.size
+            && m.mtime == info.mtime
+        {
+            if checked.elapsed() < REVALIDATE {
+                return Ok(Some(m));
+            }
+            match self.backend.head(&name)? {
+                Some((_, now)) if now == etag => {
+                    self.manifests.checked(key);
+                    return Ok(Some(m));
+                }
+                Some(_) => {} // changed: load it again
+                None => {
+                    self.drop_local(key);
+                    return Ok(None);
+                }
+            }
+        }
+        let Some((bytes, etag)) = self.backend.get_opt(&name)? else {
+            self.drop_local(key);
+            return Ok(None);
+        };
+        let m = Arc::new(Manifest::decode(&bytes)?);
+        self.manifests.insert(m.clone(), etag);
         Ok(Some(m))
     }
 
     /// A compacted blob's chunk refs, reading only that part of its manifest.
     fn refs(&self, key: &str, info: BlobInfo) -> Result<Vec<Ref>> {
-        if let Some(m) = self.manifests.get(key) {
+        if let Some((m, ..)) = self.manifests.get(key)
+            && m.size == info.size
+            && m.mtime == info.mtime
+        {
             return Ok(m.refs.clone());
         }
         let name = manifest_key(key, info);
@@ -856,13 +1061,17 @@ impl Store {
         }
     }
 
-    /// Points a still-compacted blob at moved chunks.
-    fn replace_manifest(&self, m: Manifest) -> Result<()> {
+    /// Points a still-compacted blob at moved chunks: only over its manifest as it was, so one
+    /// forgotten meanwhile (through another gateway) isn't brought back. Ok(false): it's gone.
+    fn replace_manifest(&self, m: Manifest, info: BlobInfo) -> Result<bool> {
         let _m = self.mutations.lock().unwrap();
-        let Some(info) = self.info(&m.key) else { return Ok(()) }; // deleted meanwhile
-        self.backend.put(&manifest_key(&m.key, info), m.encode(), &[])?;
-        self.manifests.insert(Arc::new(m));
-        Ok(())
+        let name = manifest_key(&m.key, info);
+        let Some((_, etag)) = self.backend.head(&name)? else { return Ok(false) };
+        let Some(new) = self.backend.put_if(&name, m.encode(), &[("if-match".into(), etag)])? else {
+            bail!("its manifest changed meanwhile");
+        };
+        self.manifests.insert(Arc::new(m), new);
+        Ok(true)
     }
 
     /// The original bytes of this compacted blob are in the bucket; serve them as they are.
@@ -881,14 +1090,16 @@ impl Store {
     }
 
     /// Puts the rebuilt original, already checked against its digest, back over the stub. Only
-    /// over the stub: if the blob was deleted or replaced meanwhile, nothing is written.
+    /// over the stub: if the blob was deleted or replaced meanwhile, or another gateway put it
+    /// back first, nothing is written.
     pub fn finish_hot_copy(&self, key: &str, file: &std::path::Path, size: u64) -> Result<()> {
         let done = (|| -> Result<()> {
             match self.backend.head(key)? {
                 Some((0, etag)) if self.info(key).is_some() => {
-                    self.backend.put_file(key, std::fs::File::open(file)?, size, &[("if-match".into(), etag)])?;
-                    self.hot.lock().unwrap().insert(key.to_string(), unix_now());
-                    crate::metrics::add(&crate::metrics::METRICS.hot_copies_made, 1);
+                    if self.backend.put_file_if(key, std::fs::File::open(file)?, size, &[("if-match".into(), etag)])?.is_some() {
+                        self.hot.lock().unwrap().insert(key.to_string(), unix_now());
+                        crate::metrics::add(&crate::metrics::METRICS.hot_copies_made, 1);
+                    }
                 }
                 Some((n, _)) if n == size => self.note_hot(key, unix_now()),
                 _ => {}
@@ -903,16 +1114,18 @@ impl Store {
         self.copying.lock().unwrap().remove(key);
     }
 
-    /// Swaps the stub back in over a hot copy nobody has read lately.
+    /// Swaps the stub back in over a hot copy nobody has read lately; nothing if the copy changed.
     pub fn cool(&self, key: &str, etag: &str) -> Result<()> {
         let Some(info) = self.info(key) else { return Ok(()) };
-        self.backend.put(key, Vec::new(), &[("x-amz-meta-rift-size".into(), info.size.to_string()), ("if-match".into(), etag.to_string())])?;
-        self.hot.lock().unwrap().remove(key);
+        if self.backend.put_if(key, Vec::new(), &stub_headers(info, etag))?.is_some() {
+            self.hot.lock().unwrap().remove(key);
+        }
         Ok(())
     }
 
     /// For leaving rift: puts every compacted blob's original bytes back (rebuilt and checked against
-    /// its digest first) and drops its manifest; deletes the packs only if every blob made it.
+    /// its digest first) and drops its manifest; deletes the packs, and everything else under
+    /// .rift/, only if every blob made it.
     /// Returns (restored, failed, bytes restored). Run it with no gateway serving the bucket.
     pub fn eject(&self, threads: usize) -> Result<(usize, usize, u64)> {
         let mut blobs: Vec<(String, BlobInfo)> = self.compacted.read().unwrap().iter().map(|(k, i)| (k.clone(), *i)).collect();
@@ -958,8 +1171,9 @@ impl Store {
                 }
             }
         }
+        // then the packs, and the rest of rift's objects (the compactor lock, reads handed over)
         if failed == 0 {
-            for o in self.backend.list(PACKS)? {
+            for o in self.backend.list(".rift/")? {
                 self.backend.delete(&o.key)?;
             }
         }
@@ -976,9 +1190,10 @@ impl Store {
         set(&METRICS.compacted_blobs, blobs);
         set(&METRICS.compacted_logical_bytes, bytes);
         set(&METRICS.hot_copies, self.hot.lock().unwrap().len() as u64);
-        let packer = self.packer.lock().unwrap();
-        set(&METRICS.packs, packer.packs.len() as u64);
-        set(&METRICS.pack_bytes, packer.packs.values().map(|p| p.0).sum());
+        if let Some(packer) = self.packer.lock().unwrap().as_ref() {
+            set(&METRICS.packs, packer.packs.len() as u64);
+            set(&METRICS.pack_bytes, packer.packs.values().map(|p| p.0).sum());
+        }
         set(&METRICS.retired_pack_bytes, self.retired.lock().unwrap().iter().map(|r| r.2).sum());
     }
 
@@ -986,19 +1201,41 @@ impl Store {
         self.forgotten.load(Ordering::Relaxed) > 0 || !self.retired.lock().unwrap().is_empty()
     }
 
+    /// A blob's chunk refs for GC; None when its manifest is gone (forgotten through another
+    /// gateway, so nothing of it is live). Any other failure could hide live chunks: an error.
+    fn live_refs(&self, key: &str, info: BlobInfo) -> Result<Option<Vec<Ref>>> {
+        match self.refs(key, info) {
+            Ok(refs) => Ok(Some(refs)),
+            Err(e) => match self.backend.head(&manifest_key(key, info)) {
+                Ok(None) => {
+                    self.drop_local(key);
+                    Ok(None)
+                }
+                _ => Err(e.context(format!("reading the chunk list of {key}"))),
+            },
+        }
+    }
+
     /// Reclaims chunks no manifest uses. A pack with nothing live is retired; a pack with less than
     /// `rewrite_below` of its bytes live has those chunks copied to new packs and its blobs pointed
     /// there, then is retired. Retired packs are deleted `grace` seconds later, so reads that
-    /// started before still find them. Run it between compactions, never during one.
-    pub fn gc(&self, rewrite_below: f64, grace: u64) -> Result<GcReport> {
+    /// started before still find them. Run it between compactions, never during one, and only
+    /// while `go()`: this gateway is the compactor.
+    pub fn gc(&self, rewrite_below: f64, grace: u64, go: &dyn Fn() -> bool) -> Result<GcReport> {
         let mut report = GcReport::default();
         let now = unix_now();
-        let mut packer = self.packer.lock().unwrap();
+        let mut guard = self.packer.lock().unwrap();
+        let packer = guard.as_mut().context("not the compactor")?;
         {
             let mut retired = self.retired.lock().unwrap();
             let (due, waiting): (Vec<_>, Vec<_>) = retired.drain(..).partition(|r| r.1 + grace <= now);
             *retired = waiting;
             for (id, when, size) in due {
+                // another compactor may have taken over and started using the pack
+                if !go() {
+                    retired.push((id, when, size));
+                    continue;
+                }
                 match self.backend.delete(&pack_key(id)).and_then(|_| self.backend.delete(&idx_key(id))) {
                     Ok(()) => {
                         report.deleted += 1;
@@ -1013,21 +1250,22 @@ impl Store {
         }
         self.forgotten.store(0, Ordering::Relaxed);
         let store = |i: u32, z: Vec<u8>, x: Vec<u8>| self.store_pack(i, z, x);
-        let blobs: Vec<(String, BlobInfo)> = self.compacted.read().unwrap().iter().map(|(k, i)| (k.clone(), *i)).collect();
+        // what's live is every manifest in the bucket: serving drops catalog entries this gateway
+        // can't use, which must never make their chunks look unused
+        let blobs: Vec<(String, BlobInfo)> = manifest_names(&self.backend.list(MANIFESTS)?).into_iter().collect();
         // pass 1: bytes each pack serves (a chunk several blobs use counts several times, which only
         // ever overstates what's live) and the packs each blob uses
         let mut served: HashMap<u32, u64> = HashMap::new();
-        let mut uses: Vec<(String, Vec<u32>)> = Vec::with_capacity(blobs.len());
+        let mut uses: Vec<(String, BlobInfo, Vec<u32>)> = Vec::with_capacity(blobs.len());
         for (key, info) in &blobs {
-            // a chunk list we can't read could hide live chunks: skip this round rather than guess
-            let refs = self.refs(key, *info).with_context(|| format!("reading the chunk list of {key}"))?;
+            let Some(refs) = self.live_refs(key, *info)? else { continue };
             for r in &refs {
                 *served.entry(r[0]).or_default() += u64::from(r[2]);
             }
             let mut packs: Vec<u32> = refs.iter().map(|r| r[0]).collect();
             packs.sort_unstable();
             packs.dedup();
-            uses.push((key.clone(), packs));
+            uses.push((key.clone(), *info, packs));
         }
         let (mut dead, mut sparse) = (HashSet::new(), HashSet::new());
         for (&id, &(_, total)) in &packer.packs {
@@ -1043,16 +1281,16 @@ impl Store {
         }
         // pass 2, only for blobs using a sparse pack: exactly which of its chunks are live
         let mut live: HashMap<u32, HashSet<u32>> = HashMap::new();
-        for (key, packs) in &uses {
+        for (key, info, packs) in &uses {
             if !packs.iter().any(|p| sparse.contains(p)) {
                 continue;
             }
-            let Some(info) = self.info(key) else { continue }; // forgotten meanwhile
-            let refs = self.refs(key, info).with_context(|| format!("reading the chunk list of {key}"))?;
+            let Some(refs) = self.live_refs(key, *info)? else { continue }; // forgotten meanwhile
             for r in refs.iter().filter(|r| sparse.contains(&r[0])) {
                 live.entry(r[0]).or_default().insert(r[1]);
             }
         }
+        ensure!(go(), "no longer the compactor");
         // copy the live chunks of sparse packs; dedup mustn't point into them meanwhile
         let mut moved: HashMap<(u32, u32), Ref> = HashMap::new();
         packer.exclude = sparse.clone();
@@ -1072,14 +1310,15 @@ impl Store {
         // on failure the old packs are still what every manifest uses; copies made so far just serve dedup
         copied.context("copying live chunks out of sparse packs")?;
         let mut stuck: HashSet<u32> = HashSet::new();
-        for (key, packs) in &uses {
+        for (key, info, packs) in &uses {
             if !packs.iter().any(|p| sparse.contains(p)) {
                 continue;
             }
             let repointed = (|| -> Result<()> {
-                let Some(m) = self.manifest(key)? else { return Ok(()) }; // deleted meanwhile
+                ensure!(go(), "no longer the compactor");
+                let Some(m) = self.manifest_for(key, *info)? else { return Ok(()) }; // forgotten meanwhile
                 let refs = m.refs.iter().map(|r| moved.get(&(r[0], r[1])).copied().unwrap_or(*r)).collect();
-                self.replace_manifest(m.with_refs(refs))
+                self.replace_manifest(m.with_refs(refs), *info).map(|_| ())
             })();
             if let Err(e) = repointed {
                 eprintln!("rift: gc: pointing {key} at its moved chunks: {e:#}");
@@ -1104,9 +1343,19 @@ impl Store {
         stream(m, start, end, workers, &|id| self.cache.get(id, &|id| self.fetch_pack(id)), sink)
     }
 
+    /// Writes a new object of rift's own: only where nothing is, when the bucket can check that.
+    fn put_new(&self, key: &str, body: Vec<u8>) -> Result<String> {
+        if !self.create_only.load(Ordering::Relaxed) {
+            return self.backend.put(key, body, &[]);
+        }
+        self.backend
+            .put_if(key, body, &[("if-none-match".into(), "*".into())])?
+            .with_context(|| format!("{key} already exists: is another compactor writing to this bucket?"))
+    }
+
     fn store_pack(&self, id: u32, pack: Vec<u8>, idx: Vec<u8>) -> Result<()> {
-        self.backend.put(&pack_key(id), pack, &[])?;
-        self.backend.put(&idx_key(id), idx, &[])?;
+        self.put_new(&pack_key(id), pack)?;
+        self.put_new(&idx_key(id), idx)?;
         Ok(())
     }
 
@@ -1121,14 +1370,18 @@ impl Store {
         self.kept.has(key, etag)
     }
 
-    /// Compacts the given blobs (key, sha256, last-modified); returns how many were compacted and
-    /// the bytes they took before and after (packs counted as they grow). A blob that can't be
-    /// compacted, or that unpacks past `max_unpacked` or MAX_RATIO times its size, is kept as is.
-    pub fn compact(&self, blobs: &[(String, String, u64)], threads: usize) -> (usize, u64) {
+    /// Compacts the given blobs (key, sha256, last-modified) while `go()`; returns how many were
+    /// compacted and the bytes they took before. A blob that can't be compacted, or that unpacks
+    /// past `max_unpacked` or MAX_RATIO times its size, is kept as is.
+    pub fn compact(&self, blobs: &[(String, String, u64)], threads: usize, go: &dyn Fn() -> bool) -> (usize, u64) {
+        let Some(index) = self.index.clone() else { return (0, 0) };
         let mut ready = Vec::new();
         for (key, digest, mtime) in blobs {
+            if !go() {
+                break;
+            }
             // counted on disk first: a blob that keeps taking rift down isn't tried forever
-            if self.index.begin_attempt(key).unwrap_or(1) > MAX_TRIES {
+            if index.begin_attempt(key).unwrap_or(1) > MAX_TRIES {
                 self.keep(key, "*", &format!("rift stopped {MAX_TRIES} times while compacting it"));
                 continue;
             }
@@ -1140,7 +1393,8 @@ impl Store {
                 let limit = self.max_unpacked.min(data.len() as u64 * MAX_RATIO);
                 match analyze(key, digest, *mtime, &data, threads, limit as usize)? {
                     Unpacked::Done(mut m, plain) => {
-                        let refs = self.packer.lock().unwrap().add(&plain, &|id, z, idx| self.store_pack(id, z, idx))?;
+                        let mut packer = self.packer.lock().unwrap();
+                        let refs = packer.as_mut().context("not the compactor")?.add(&plain, &|id, z, idx| self.store_pack(id, z, idx))?;
                         m.set_refs(refs);
                         Ok(Ok((m, etag)))
                     }
@@ -1148,7 +1402,7 @@ impl Store {
                     Unpacked::TooBig => Ok(Err((etag, format!("unpacks to more than {} MB", limit.div_ceil(1 << 20))))),
                 }
             })();
-            let _ = self.index.end_attempt(key);
+            let _ = index.end_attempt(key);
             match attempt {
                 Ok(Ok(r)) => ready.push(r),
                 Ok(Err((etag, why))) => self.keep(key, &etag, &why),
@@ -1156,11 +1410,17 @@ impl Store {
                 Err(e) => eprintln!("rift: {key}: {e:#}"),
             }
         }
-        if let Err(e) = self.packer.lock().unwrap().flush(&|id, z, idx| self.store_pack(id, z, idx)) {
+        if let Some(packer) = self.packer.lock().unwrap().as_mut()
+            && let Err(e) = packer.flush(&|id, z, idx| self.store_pack(id, z, idx))
+        {
             eprintln!("rift: storing a pack failed, its blobs stay as they were: {e:#}");
         }
         let (mut done, mut bytes) = (0, 0);
         for (m, etag) in ready {
+            // the packs are stored; these blobs are compacted next round, by whoever compacts then
+            if !go() {
+                break;
+            }
             let (key, size) = (m.key.clone(), m.size);
             match self.commit(m, &etag, threads) {
                 Ok(true) => {
@@ -1183,20 +1443,14 @@ impl Store {
             return Ok(false);
         }
         let info = BlobInfo { size: m.size, mtime: m.mtime };
-        self.backend.put(&manifest_key(&key, info), m.encode(), &[])?;
-        let size = m.size;
+        let manifest_etag = self.put_new(&manifest_key(&key, info), m.encode())?;
         {
             let _m = self.mutations.lock().unwrap();
             self.compacted.write().unwrap().insert(key.clone(), info);
-            self.manifests.insert(Arc::new(m));
+            self.manifests.insert(Arc::new(m), manifest_etag);
         }
         // the stub keeps the key in listings; If-Match so a blob deleted meanwhile isn't brought back
-        let stub = self.backend.put(
-            &key,
-            Vec::new(),
-            &[("x-amz-meta-rift-size".into(), size.to_string()), ("if-match".into(), etag.to_string())],
-        );
-        if let Err(e) = stub {
+        if let Err(e) = self.backend.put(&key, Vec::new(), &stub_headers(info, etag)) {
             self.forget(&key);
             return Err(e.context("replacing the original with a stub"));
         }
@@ -1331,15 +1585,34 @@ mod tests {
     }
 
     #[test]
+    fn newest_manifest_per_blob() {
+        let o = |key: String| Object { key, size: 1, modified: 0, etag: String::new() };
+        let (a, b) = ("x/blobs/sha256/ab/abc/data", "x/blobs/sha256/cd/cde/data");
+        let names = super::manifest_names(&[
+            o(manifest_key(a, BlobInfo { size: 10, mtime: 5 })),
+            o(manifest_key(a, BlobInfo { size: 10, mtime: 9 })),
+            o(manifest_key(b, BlobInfo { size: 20, mtime: 1 })),
+            o(".rift/packs/00000001.zst".into()),
+        ]);
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[a], BlobInfo { size: 10, mtime: 9 }, "a re-compacted blob's later manifest");
+        assert_eq!(names[b], BlobInfo { size: 20, mtime: 1 });
+        // a stub says what it stands for, and replaces only the version it was made from
+        let hs = stub_headers(BlobInfo { size: 10, mtime: 9 }, "\"e\"");
+        assert!(hs.contains(&("x-amz-meta-rift-size".into(), "10".into())) && hs.contains(&("x-amz-meta-rift-mtime".into(), "9".into())));
+        assert!(hs.contains(&("if-match".into(), "\"e\"".into())));
+    }
+
+    #[test]
     fn manifest_cache_keeps_recent() {
         let m = |k: &str| {
             Arc::new(Manifest::new(k.into(), 0, "0".repeat(64), 0, vec![], vec![], vec![], vec![], vec![0; 1000]))
         };
         let cache = ManifestCache::new(3000);
-        cache.insert(m("a"));
-        cache.insert(m("b"));
+        cache.insert(m("a"), String::new());
+        cache.insert(m("b"), String::new());
         assert!(cache.get("a").is_some()); // a is now the most recent
-        cache.insert(m("c")); // over budget: b goes
+        cache.insert(m("c"), String::new()); // over budget: b goes
         assert!(cache.get("a").is_some() && cache.get("c").is_some() && cache.get("b").is_none());
     }
 
