@@ -6,8 +6,13 @@ metadata:
     {{- include "rift.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.service.type }}
+  # the gateways that only serve; without any, the compactor serves
   selector:
+    {{- if gt (int .Values.serve.replicas) 0 }}
+    {{- include "rift.serveSelector" . | nindent 4 }}
+    {{- else }}
     {{- include "rift.selector" . | nindent 4 }}
+    {{- end }}
   ports:
     - name: s3
       port: {{ .Values.service.port }}

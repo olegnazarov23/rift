@@ -50,9 +50,27 @@ serviceAccount:
   name: ""
   annotations: {}
 
+# Gateways that only serve sit behind the Service; the compactor (the Deployment without a
+# suffix) compacts the bucket and collects garbage for them all. With two or more, losing one, or
+# a rolling update, doesn't interrupt the registry. 0: the compactor serves alone (no high
+# availability).
+serve:
+  replicas: 2
+  # cold reads are rebuilt here: room for cached manifests (512 MB), cached packs (up to 1 GB)
+  # and rebuilds in flight
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      memory: 4Gi
+  # prefer different nodes for them (ignored when affinity is set)
+  spreadOverNodes: true
+
 # Cold reads rebuild on these cores; compaction uses them too. Each adds ~135 MB while compacting.
 # Leave it set: without a CPU limit, rift would otherwise use every core on the node.
 threads: "4"
+# the compactor's
 resources:
   requests:
     cpu: "2"

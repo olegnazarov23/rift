@@ -1,0 +1,112 @@
+{{- if gt (int .Values.serve.replicas) 0 }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rift.fullname" . }}-serve
+  labels:
+    {{- include "rift.labels" . | nindent 4 }}
+    app.kubernetes.io/component: serve
+spec:
+  # gateways that only serve, behind the Service: any one can go (a crash, a node, a rolling
+  # update) while the others carry on
+  replicas: {{ .Values.serve.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "rift.serveSelector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rift.serveSelector" . | nindent 8 }}
+        app.kubernetes.io/component: serve
+      annotations:
+        checksum/config: {{ toJson .Values | sha256sum }}
+        {{- if .Values.metrics.prometheusAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /-/metrics
+        prometheus.io/port: "9100"
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "rift.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: rift
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- include "rift.servingArgs" . | nindent 12 }}
+            - --serve-only
+          envFrom:
+            - secretRef:
+                name: {{ include "rift.secret" . }}
+          ports:
+            - name: s3
+              containerPort: 9100
+          readinessProbe:
+            httpGet:
+              path: /-/healthz
+              port: s3
+              scheme: {{ if .Values.tls.secretName }}HTTPS{{ else }}HTTP{{ end }}
+          livenessProbe:
+            httpGet:
+              path: /-/healthz
+              port: s3
+              scheme: {{ if .Values.tls.secretName }}HTTPS{{ else }}HTTP{{ end }}
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.serve.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.tls.secretName }}
+            - name: tls
+              mountPath: /etc/rift/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if .Values.tls.secretName }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        {{- end }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmp.sizeLimit }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if .Values.serve.spreadOverNodes }}
+      # on different nodes where there's room, so one node going doesn't take them all
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "rift.serveSelector" . | nindent 20 }}
+      {{- end }}
+{{- end }}

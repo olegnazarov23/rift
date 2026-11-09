@@ -5,7 +5,8 @@ metadata:
   labels:
     {{- include "rift.labels" . | nindent 4 }}
 spec:
-  # one gateway per bucket: two would compact and collect the same packs
+  # the compactor: one per bucket (it holds .rift/compactor; another would only stand by). It also
+  # serves when serve.replicas is 0.
   replicas: 1
   strategy:
     type: Recreate
@@ -16,6 +17,7 @@ spec:
     metadata:
       labels:
         {{- include "rift.selector" . | nindent 8 }}
+        app.kubernetes.io/component: compactor
       annotations:
         checksum/config: {{ toJson .Values | sha256sum }}
         {{- if .Values.metrics.prometheusAnnotations }}
@@ -36,41 +38,14 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
-            - gateway
-            - --listen=0.0.0.0:9100
-            - --backend={{ .Values.backend.endpoint }}
-            - --bucket={{ .Values.backend.bucket }}
-            - --region={{ .Values.backend.region }}
+            {{- include "rift.servingArgs" . | nindent 12 }}
             - --cold-after={{ .Values.compaction.coldAfter }}
-            - --interval={{ .Values.compaction.interval }}
             - --min-size-mb={{ .Values.compaction.minSizeMB }}
             - --pack-level={{ .Values.compaction.packLevel }}
             - --max-unpacked-mb={{ .Values.compaction.maxUnpackedMB }}
             - --gc-grace={{ .Values.gc.grace }}
             - --gc-rewrite-below={{ .Values.gc.rewriteBelow }}
             - --state-dir=/var/lib/rift
-            - --max-body-mb={{ .Values.limits.maxBodyMB }}
-            - --max-requests={{ .Values.limits.maxRequests }}
-            - --max-cold-reads={{ .Values.limits.maxColdReads }}
-            - --max-spill-gb={{ .Values.limits.maxSpillGB }}
-            - --client-timeout-secs={{ .Values.limits.clientTimeoutSecs }}
-            - --max-connections={{ .Values.limits.maxConnections }}
-            {{- if .Values.accessLog }}
-            - --access-log
-            {{- end }}
-            {{- if .Values.tls.secretName }}
-            - --tls-cert=/etc/rift/tls/tls.crt
-            - --tls-key=/etc/rift/tls/tls.key
-            {{- end }}
-            {{- with .Values.backend.redirectEndpoint }}
-            - --redirect-endpoint={{ . }}
-            {{- end }}
-            {{- if not .Values.compaction.hotCopy }}
-            - --no-hot-copy
-            {{- end }}
-            {{- with .Values.threads }}
-            - --threads={{ . }}
-            {{- end }}
           envFrom:
             - secretRef:
                 name: {{ include "rift.secret" . }}

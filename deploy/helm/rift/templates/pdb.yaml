@@ -1,0 +1,14 @@
+{{- if gt (int .Values.serve.replicas) 1 }}
+# voluntary disruptions (node drains, upgrades) take serving gateways one at a time
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "rift.fullname" . }}-serve
+  labels:
+    {{- include "rift.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "rift.serveSelector" . | nindent 6 }}
+{{- end }}

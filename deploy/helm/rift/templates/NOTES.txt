@@ -2,6 +2,12 @@ rift is serving S3 for bucket {{ .Values.backend.bucket }} at:
 
   {{ if .Values.tls.secretName }}https{{ else }}http{{ end }}://{{ include "rift.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
 
+{{- if gt (int .Values.serve.replicas) 0 }}
+
+{{ .Values.serve.replicas }} gateways ({{ include "rift.fullname" . }}-serve) serve behind it; {{ include "rift.fullname" . }} compacts the
+bucket and collects garbage for them. Losing one serving gateway doesn't interrupt the registry.
+{{- end }}
+
 Point your registry's S3 storage at that endpoint (path-style), using the client keys, and keep
 the bucket name. Nothing in the bucket changes until blobs have been cold for {{ .Values.compaction.coldAfter }}.
 See docs/PILOT.md for distribution, Harbor and GitLab settings, and `rift eject` to leave.
