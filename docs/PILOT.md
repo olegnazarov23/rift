@@ -256,7 +256,7 @@ policy above.
 
 ## 10. Limits of this pilot build
 
-- One rift per bucket; there's no high availability yet. While rift is down, pulls of compacted
+- One rift per bucket; there's no high availability yet ([design proposal](HA.md)). While rift is down, pulls of compacted
   blobs wait for it (recent blobs are in the bucket as they were).
 - Compaction runs at about 0.5 MB/s per core. A large registry takes a while to backfill; new
   pushes are a small daily stream.
