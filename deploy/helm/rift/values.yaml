@@ -1,7 +1,7 @@
 image:
   # published for amd64 and arm64 from this repo's version tags
   repository: ghcr.io/olegnazarov23/rift
-  tag: "0.1.1"
+  tag: "0.1.2"
   pullPolicy: IfNotPresent
 
 # The bucket your registry stores in today. rift keeps everything in it, under .rift/.
