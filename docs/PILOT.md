@@ -37,7 +37,7 @@ in the environment:
 | Variable | What it is |
 |---|---|
 | `RIFT_BACKEND_ACCESS_KEY`, `RIFT_BACKEND_SECRET_KEY` | rift's key to the bucket; leave them out to use an IAM role |
-| `RIFT_CLIENT_ACCESS_KEY`, `RIFT_CLIENT_SECRET_KEY` | keys you make up; the registry signs its requests to rift with them |
+| `RIFT_CLIENT_ACCESS_KEY`, `RIFT_CLIENT_SECRET_KEY` | keys you make up (the secret at least 16 characters: `openssl rand -hex 20`); the registry signs its requests to rift with them. rift won't start without them |
 
 **IAM roles instead of a key.** Without `RIFT_BACKEND_*`, rift finds credentials the way AWS's SDKs
 do: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`), then IRSA, EKS Pod
@@ -136,9 +136,18 @@ endpoint as well as the registry.
 - The body against what was signed: a signed payload hash is checked (400
   `XAmzContentSHA256Mismatch`), every chunk of a signed `aws-chunked` upload is checked against its
   chunk signature, and trailing checksums (`x-amz-checksum-*`) go on to the bucket, which checks them.
+- Headers that change what's stored or how a body is read (`x-amz-*`, `Content-MD5`,
+  `Content-Encoding`) must be signed, as S3 requires; otherwise 403.
+- Only the requests registries make are passed on: object reads, writes, copies and deletes,
+  multipart uploads and listings. Everything else (tagging, ACLs, versions, bucket policy and other
+  bucket settings) gets 501 `NotImplemented`, whatever the keys. Change bucket settings at the
+  bucket itself.
 - `.rift/` isn't reachable through rift, so clients can't read or overwrite packs and manifests.
+  Keys that start with `/` or hold empty, `.` or `..` segments get 400; registries never use them.
 - Logs never contain signatures or keys, also with `RIFT_DEBUG=1` (every request, with headers)
-  and `--access-log` (a JSON audit line per request; see Watching it).
+  and `--access-log` (a JSON audit line per request; see Watching it), and control characters in
+  requests are escaped. Errors on rift's side tell the client only what failed; the details are in
+  rift's log.
 
 **Limits.** Past these, a client gets 413 or 503 `SlowDown`; registries and S3 clients retry 503s.
 
@@ -154,7 +163,9 @@ endpoint as well as the registry.
 
 Request headers are capped at 64 KB and 200 lines. A client that connects and stalls, or drips its
 headers (slowloris), is dropped after `--client-timeout-secs`, so it can hold a connection only that
-long; a flood past `--max-connections` is refused until those time out.
+long; a flood past `--max-connections` is refused until those time out. A connection carries one
+request at a time. When rift answers before reading a body (a refused upload, say), it reads and
+drops at most 64 KB of it and otherwise closes the connection.
 
 rift unpacks layers to compact them, which a registry never does, so a pushed layer could be a
 deflate bomb (a few MB that unpack to gigabytes). Compaction stops unpacking at `--max-unpacked-mb`
@@ -175,8 +186,12 @@ network: signatures stop tampering and replays, but blob contents cross the netw
 **Keys and network**
 
 - Prefer an IAM role to a backend key; either way it's the only thing that reaches the bucket
-  itself, so scope it to that bucket (the policy in section 3). The client keys only work at rift. Rotate them by changing the Secret and the registry's config
-  together; rift reads keys at start.
+  itself, so scope it to that bucket (the policy in section 3). The client keys only work at rift.
+  Rotate them by changing the Secret and the registry's config together; rift reads keys at start.
+- `--state-dir` holds the chunk index: keep it writable only by rift's user (the chart's is). The
+  default is `~/.cache/rift/<bucket>`, not the shared temp dir.
+- For a local trial without client keys, `--no-client-auth` accepts unsigned requests, but only on
+  a loopback address such as `127.0.0.1`.
 - Only the registry needs to reach rift, plus the machines that pull if redirects are on (presigned
   URLs point at rift). Admit just those with a NetworkPolicy or security group; the limits above
   bound what anyone else could do.
