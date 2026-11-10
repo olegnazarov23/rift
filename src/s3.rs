@@ -267,7 +267,8 @@ impl Backend {
         let read = |what: &str| -> std::result::Result<Option<String>, String> {
             match self.send("GET", "", &[(what.to_string(), String::new())], &[], Vec::new()) {
                 Ok(r) if r.status().is_success() => Ok(Some(r.text().unwrap_or_default())),
-                Ok(r) if r.status().as_u16() == 404 => Ok(None),
+                // 404: none set; 501: a store without the feature (versitygw has no lifecycle rules)
+                Ok(r) if matches!(r.status().as_u16(), 404 | 501) => Ok(None),
                 Ok(r) => Err(r.status().as_u16().to_string()),
                 Err(e) => Err(format!("{e:#}")),
             }
