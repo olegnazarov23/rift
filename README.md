@@ -1,4 +1,9 @@
-# rift
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/rift-logo-dark.svg">
+    <img alt="rift" src="docs/logo/rift-logo.svg" height="64">
+  </picture>
+</h1>
 
 Byte-exact recompression for container registry storage. rift sits between your registry and the
 S3 bucket it already uses, and stores image layers in less space: 39–79% less in our tests. Every

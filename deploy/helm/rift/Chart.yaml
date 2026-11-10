@@ -1,6 +1,7 @@
 apiVersion: v2
 name: rift
 description: Byte-exact recompression in front of a container registry's S3 bucket
+icon: https://raw.githubusercontent.com/olegnazarov23/rift/main/docs/logo/rift-icon.png
 type: application
 version: 0.1.6
 appVersion: "0.1.6"
