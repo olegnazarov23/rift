@@ -1,0 +1,18 @@
+# distribution's config: the bucket's own name, rift as the endpoint, and the client keys rift checks
+version: 0.1
+storage:
+  s3:
+    accesskey: demo-registry
+    secretkey: demo-registry-secret
+    region: us-east-1
+    regionendpoint: http://rift:9100
+    bucket: registry
+    forcepathstyle: true
+    secure: false
+    v4auth: true
+  redirect:
+    disable: true
+  delete:
+    enabled: true
+http:
+  addr: :5000

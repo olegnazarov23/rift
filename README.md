@@ -30,6 +30,11 @@ what it stored and checked its digest, and a read rebuilds it as a stream.
 
 The full picture, with what it costs and where it falls short: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 
+## See it work
+
+[demo/](demo/) runs a registry through rift on your machine with Docker Compose. You push six images,
+watch rift store them in 59% less space, and read them back, in a few minutes.
+
 ## Try it: how much would your registry save?
 
 `rift scan` estimates the saving on a registry's images. It only reads, and it rebuilds every blob

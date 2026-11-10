@@ -1,0 +1,79 @@
+# rift on your machine in a few minutes: a registry stores its images through rift, in an S3 store.
+# The steps are in README.md.
+name: rift-demo
+
+services:
+  # The S3 store. versitygw serves a directory as S3, one file per object, so the disk shows what's
+  # really stored.
+  s3:
+    image: versity/versitygw:v1.10.0
+    entrypoint: ["sh", "-c", "mkdir -p /data/registry && exec versitygw posix /data"]
+    environment:
+      ROOT_ACCESS_KEY: demo-backend
+      ROOT_SECRET_KEY: demo-backend-secret
+    volumes:
+      - bucket:/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "7070"]
+      interval: 1s
+      retries: 30
+
+  # rift, in front of the bucket. Here a blob goes cold after 20 seconds untouched instead of 7
+  # days, and compaction holds at most 1 GB of unpacked layers, which fits Docker on a laptop.
+  rift:
+    image: ghcr.io/olegnazarov23/rift:0.1.6
+    command: >-
+      gateway --listen 0.0.0.0:9100 --backend http://s3:7070 --bucket registry
+      --cold-after 20s --interval 20s --max-unpacked-mb 1024
+    environment:
+      RIFT_BACKEND_ACCESS_KEY: demo-backend
+      RIFT_BACKEND_SECRET_KEY: demo-backend-secret
+      RIFT_CLIENT_ACCESS_KEY: demo-registry
+      RIFT_CLIENT_SECRET_KEY: demo-registry-secret
+    depends_on:
+      s3:
+        condition: service_healthy
+
+  # The registry (distribution), with rift as its S3 endpoint: registry.yml.
+  registry:
+    image: registry:2.8.3
+    volumes:
+      - ./registry.yml:/etc/docker/registry/config.yml:ro
+    ports:
+      - "127.0.0.1:5005:5000"
+    depends_on: [rift]
+
+  # The steps, each run with `docker compose run --rm <step>`. tools.sh has what they do.
+  push:
+    image: gcr.io/go-containerregistry/crane/debug:v0.22.1
+    profiles: [steps]
+    entrypoint: ["sh", "/tools.sh", "push"]
+    environment: &images
+      # Docker Hub's official images, from Amazon's mirror of them: Docker Hub allows few anonymous
+      # pulls an hour
+      SOURCE: ${SOURCE:-public.ecr.aws/docker/library}
+      IMAGES: ${IMAGES:-redis:7.4.0 redis:7.4.1 redis:7.4.2 postgres:17.2 postgres:17.3 postgres:17.4}
+    volumes:
+      - ./tools.sh:/tools.sh:ro
+    depends_on: [registry]
+
+  check:
+    image: gcr.io/go-containerregistry/crane/debug:v0.22.1
+    profiles: [steps]
+    entrypoint: ["sh", "/tools.sh", "check"]
+    environment: *images
+    volumes:
+      - ./tools.sh:/tools.sh:ro
+    depends_on: [registry]
+
+  stats:
+    image: versity/versitygw:v1.10.0
+    profiles: [steps]
+    entrypoint: ["sh", "/tools.sh", "stats"]
+    volumes:
+      - ./tools.sh:/tools.sh:ro
+      - bucket:/data:ro
+    depends_on: [rift]
+
+volumes:
+  bucket:
